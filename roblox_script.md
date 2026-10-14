@@ -9,6 +9,8 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
+local SCRIPT_VERSION = "1.0.0" -- bump on every edit
+
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
 local TEAM_A_NAME = "Black"
@@ -183,6 +185,21 @@ UI.ResetOnSpawn = false
 UI.IgnoreGuiInset = true
 pcall(function() UI.Parent = game:GetService("CoreGui") end)
 if not UI.Parent then UI.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local VersionLabel = Instance.new("TextLabel")
+VersionLabel.Name = "VersionLabel"
+VersionLabel.AnchorPoint = Vector2.new(0, 1)
+VersionLabel.Position = UDim2.new(0, 8, 1, -8)
+VersionLabel.Size = UDim2.fromOffset(160, 16)
+VersionLabel.BackgroundTransparency = 1
+VersionLabel.Text = "Tracker v" .. SCRIPT_VERSION
+VersionLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+VersionLabel.TextTransparency = 0.3
+VersionLabel.Font = Enum.Font.GothamBold
+VersionLabel.TextSize = 11
+VersionLabel.TextXAlignment = Enum.TextXAlignment.Left
+VersionLabel.ZIndex = 60
+VersionLabel.Parent = UI
 
 local function makePanel(name, title, size, pos)
 	local f = Instance.new("Frame")
