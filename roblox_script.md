@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.1.0" -- bump on every edit
+local SCRIPT_VERSION = "1.1.1" -- bump on every edit
 local SCRIPT_URL = "https://raw.githubusercontent.com/vinkdc/obs-script/refs/heads/main/roblox_script.md"
 local UPDATE_CHECK_SECONDS = 90
 
