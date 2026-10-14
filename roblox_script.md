@@ -9,7 +9,9 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.0.1" -- bump on every edit
+local SCRIPT_VERSION = "1.1.0" -- bump on every edit
+local SCRIPT_URL = "https://raw.githubusercontent.com/vinkdc/obs-script/refs/heads/main/roblox_script.md"
+local UPDATE_CHECK_SECONDS = 90
 
 --// ANTI-AFK
 pcall(function()
@@ -194,6 +196,16 @@ UI.ResetOnSpawn = false
 UI.IgnoreGuiInset = true
 pcall(function() UI.Parent = game:GetService("CoreGui") end)
 if not UI.Parent then UI.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local Unload = function()
+	Running = false
+	UI:Destroy()
+end
+do
+	local genv = getgenv and getgenv() or _G
+	if genv.ScrimUnload then pcall(genv.ScrimUnload) end -- stop an older copy before this one runs
+	genv.ScrimUnload = Unload
+end
 
 local function makePanel(name, title, size, pos)
 	local f = Instance.new("Frame")
@@ -2229,6 +2241,27 @@ do
 			end
 		end)
 	end
+
+	--// auto-update: swap to the newer GitHub copy, only between matches
+	task.spawn(function()
+		while Running do
+			task.wait(UPDATE_CHECK_SECONDS)
+			local ok, src = pcall(function() return game:HttpGet(SCRIPT_URL .. "?t=" .. os.time()) end)
+			local newVersion = ok and type(src) == "string" and src:match('local SCRIPT_VERSION = "([^"]+)"')
+			if newVersion and newVersion ~= SCRIPT_VERSION then
+				local fn = loadstring(src)
+				if fn then
+					while Running and phase ~= "LOBBY" and phase ~= "BREAK" and phase ~= "IDLE" do task.wait(5) end
+					if Running then
+						print("[SCRIM] Updating " .. SCRIPT_VERSION .. " -> " .. newVersion)
+						Unload()
+						task.spawn(fn)
+						return
+					end
+				end
+			end
+		end
+	end)
 
 	print(string.format("[SCRIM] API %s | remote gap %.1fs | kick lockout %s | DRY_RUN %s", API_URL, ACTION_GAP, tostring(KICK_DURATION), tostring(DRY_RUN)))
 	print("[SCRIM] Agent ready. Waiting for /scrim start" .. (DRY_RUN and " (DRY RUN: no remotes are fired)" or ""))
