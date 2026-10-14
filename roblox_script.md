@@ -145,7 +145,7 @@ local LastBombHolderName = nil
 local Running = true
 
 local function ensureStats(name)
-	if not MatchStats[name] then MatchStats[name] = { Kills = 0, Deaths = 0, Assists = 0, Aces = 0, Clutches = 0 } end
+	if not MatchStats[name] then MatchStats[name] = { Kills = 0, Deaths = 0, Assists = 0, TeamKills = 0, Aces = 0, Clutches = 0 } end
 	return MatchStats[name]
 end
 
@@ -462,7 +462,7 @@ end
 --  * BombHistory is the ordered list of players who held the bomb since the last explosion.
 --  * The moment the CURRENT bomb holder dies, we snapshot the chain and reset BombHistory,
 --    so a new bomb / dead-player tool events can't pollute it.
---  * Killer = the player who passed the bomb last, even if the victim is their teammate (still counts as a kill).
+--  * Killer = the player who passed the bomb last. If the victim is their teammate it is a team kill (TeamKills, not Kills).
 --    No previous holder = self-kill (no kill credit).
 --  * Assist = the third-last holder (who passed it to the killer), only if on the killer's team; nobody else.
 
@@ -582,11 +582,15 @@ local function processPendingDeaths()
 
 		ensureStats(victim).Deaths += 1
 		if killer then
-			ensureStats(killer).Kills += 1
-			credited[killer] = true
-			if PlayerTeams[killer] and PlayerTeams[victim] and PlayerTeams[killer] ~= PlayerTeams[victim] then
-				roundKills[killer] = (roundKills[killer] or 0) + 1
+			if PlayerTeams[killer] and PlayerTeams[victim] and PlayerTeams[killer] == PlayerTeams[victim] then
+				ensureStats(killer).TeamKills += 1 -- a sac: no kill credit, counts against the passer
+			else
+				ensureStats(killer).Kills += 1
+				if PlayerTeams[killer] and PlayerTeams[victim] then
+					roundKills[killer] = (roundKills[killer] or 0) + 1
+				end
 			end
+			credited[killer] = true
 		end
 		print(string.format("[DEATH] %s(%s) killed by %s", victim, tostring(PlayerTeams[victim] or "?"), tostring(killer)))
 		announceKill(victim, killer)
@@ -1089,7 +1093,7 @@ do
 
 	local function copyStats(stats)
 		local out = {}
-		for name, s in pairs(stats) do out[name] = { Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, Aces = s.Aces or 0, Clutches = s.Clutches or 0 } end
+		for name, s in pairs(stats) do out[name] = { Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, TeamKills = s.TeamKills or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0 } end
 		return out
 	end
 
@@ -1252,8 +1256,8 @@ do
 		local stats = {}
 		if phase == "LIVE" then
 			for id, info in pairs(matchRoster) do
-				local s = MatchStats[info.name] or { Kills = 0, Deaths = 0, Assists = 0, Aces = 0, Clutches = 0 }
-				table.insert(stats, { UserId = id, Name = info.name, Team = info.team, Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, Aces = s.Aces or 0, Clutches = s.Clutches or 0 })
+				local s = MatchStats[info.name] or { Kills = 0, Deaths = 0, Assists = 0, TeamKills = 0, Aces = 0, Clutches = 0 }
+				table.insert(stats, { UserId = id, Name = info.name, Team = info.team, Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, TeamKills = s.TeamKills or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0 })
 			end
 		end
 		local timed = {}
@@ -1403,7 +1407,7 @@ do
 				PlayerTeams[s.Name] = s.Team
 				nameById[id], lockedIds[id] = s.Name, true
 				table.insert(teamOrder[s.Team], id)
-				MatchStats[s.Name] = { Kills = s.Kills or 0, Deaths = s.Deaths or 0, Assists = s.Assists or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0 }
+				MatchStats[s.Name] = { Kills = s.Kills or 0, Deaths = s.Deaths or 0, Assists = s.Assists or 0, TeamKills = s.TeamKills or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0 }
 				if s.Team == TEAM_A_NAME then perSide += 1 end
 				local pl = Players:GetPlayerByUserId(id)
 				if pl then updatePlayerNametag(pl) else leftAt[id] = os.clock() end -- not in the server right now: may rejoin
@@ -1569,8 +1573,8 @@ do
 			stats = {},
 		}
 		for id, info in pairs(matchRoster) do
-			local s = stats[info.name] or { Kills = 0, Deaths = 0, Assists = 0, Aces = 0, Clutches = 0 }
-			table.insert(final.stats, { UserId = id, Name = info.name, Team = info.team, Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, Aces = s.Aces or 0, Clutches = s.Clutches or 0,
+			local s = stats[info.name] or { Kills = 0, Deaths = 0, Assists = 0, TeamKills = 0, Aces = 0, Clutches = 0 }
+			table.insert(final.stats, { UserId = id, Name = info.name, Team = info.team, Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, TeamKills = s.TeamKills or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0,
 				Left = leftAt[id] ~= nil and not voteKicked[id], Kicked = voteKicked[id] == true })
 		end
 		table.insert(pendingFinals, final)
