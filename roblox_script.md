@@ -9,7 +9,16 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.0.0" -- bump on every edit
+local SCRIPT_VERSION = "1.0.1" -- bump on every edit
+
+--// ANTI-AFK
+pcall(function()
+	local VirtualUser = game:GetService("VirtualUser")
+	LocalPlayer.Idled:Connect(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+end)
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
