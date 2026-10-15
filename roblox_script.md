@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.1.6" -- bump on every edit
+local SCRIPT_VERSION = "1.1.10" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -197,15 +197,19 @@ do
 	local genv = getgenv and getgenv() or _G
 	if genv.ScrimUnload then pcall(genv.ScrimUnload) end -- stop an older copy before this one runs
 	genv.ScrimUnload = Unload
-	-- SetActivity is a toggle: fire it once on the first execute so the bot account is not put into the match.
-	-- The flag survives re-executes (a second call would turn it back on).
-	if not genv.ScrimActivitySet then
-		genv.ScrimActivitySet = true
+	-- SetActivity is a toggle: fire it once per server on load so the bot account is not put into the match.
+	-- Keyed by JobId: getgenv() outlives teleports, so a plain flag would skip every server after the first one,
+	-- while a re-execute in the same server must not flip it back.
+	if genv.ScrimActivityJob ~= game.JobId then
+		genv.ScrimActivityJob = game.JobId
 		if DRY_RUN then
 			print("[DRY_RUN] InvokeServer SetActivity")
 		else
-			task.spawn(pcall, function() -- InvokeServer yields; never let it hold up the rest of the script
-				game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteFunction"):InvokeServer("SetActivity")
+			task.spawn(function() -- InvokeServer yields; never let it hold up the rest of the script
+				local ok, result = pcall(function()
+					return game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteFunction"):InvokeServer("SetActivity")
+				end)
+				print("[SCRIM] SetActivity ->", ok, tostring(result))
 			end)
 		end
 	end
@@ -1053,7 +1057,7 @@ do
 				-- merge everything that queued up while waiting (up to the 200 char limit), oldest first
 				local text = table.remove(announceQ, 1) -- nil if Act.clear() ran while waiting
 				if not text then continue end
-				while announceQ[1] and #text + 3 + #announceQ[1] <= 200 do
+				while announceQ[1] and #text + 3 + #announceQ[1] <= 100 do
 					text = text .. " | " .. table.remove(announceQ, 1)
 				end
 				lastAnnounce = os.clock()
@@ -1115,10 +1119,14 @@ do
 	local function say(msg) Act.announce(msg) end
 
 	local RESET_LOCK_PHASES = { CAPTAINS = true, DRAFT = true, LIVE = true, POSTGAME = true }
-	local resetBlocked = false -- "TimebombResetting" is a toggle: on while a match is running so players cannot reset
+	-- "TimebombResetting" is a toggle: on while a match is running so players cannot reset.
+	-- The state is kept in getgenv() (per server) so a re-executed script does not flip a toggle it did not set.
+	local resetGenv = getgenv and getgenv() or _G
+	local resetBlocked = resetGenv.ScrimResetJob == game.JobId and resetGenv.ScrimResetBlocked == true
 	local function setResetBlocked(on)
 		if on == resetBlocked then return end
 		resetBlocked = on
+		resetGenv.ScrimResetJob, resetGenv.ScrimResetBlocked = game.JobId, on
 		Act.fireFirst("TimebombResetting")
 	end
 	local function setPhase(p)
@@ -1906,15 +1914,14 @@ do
 			if kind == "win" and value then return value end
 			if kind == "tie" then
 				tied = value
-				if attempt < 3 then say("Tie! Replaying the captain round...") end
 			elseif attempt < 3 then
-				say("The captain round did not start. Trying again...")
+				say("Round did not start, retrying")
 			end
 		end
 		local choices = (tied and #tied > 0) and tied or eligible
 		if #choices == 0 then return nil end
 		local chosen = choices[rng:NextInteger(1, #choices)]
-		say(nameOf(chosen) .. " is chosen at random as captain.")
+		say(nameOf(chosen) .. " is random captain")
 		return chosen
 	end
 
@@ -1982,7 +1989,7 @@ do
 		setCaptain(TEAM_B_NAME, secondCaptain)
 		draftId, draftDone, draftApplied, draftPerSide = newMatchId(), false, {}, perSide
 		setPhase("DRAFT")
-		say(string.format("Draft! %s (%s) and %s (%s) pick in Discord, %ds per pick.", nameOf(firstCaptain), TEAM_A_NAME, nameOf(secondCaptain), TEAM_B_NAME, cfg.pick_seconds))
+		say(string.format("Draft: captains pick in Discord (%ds)", cfg.pick_seconds))
 
 		local started = os.clock()
 		local limit = cfg.pick_seconds * perSide * 2 + 120 -- only reached if the bot stops answering
@@ -2007,7 +2014,7 @@ do
 		matchRoster, PlayerTeams = {}, {}
 		if RoundActive then endCaptainRound() end -- a practice round must be fully over before anonymous mode is toggled
 		setAnonymous(true)
-		say("Captain selection: two bomb rounds. The last player standing in each becomes a captain.")
+		say("Captain rounds: last one standing")
 		Act.drainUrgent() -- the toggle goes out first (ahead of any kick backlog)...
 		task.wait(ANONYMOUS_SETTLE) -- ...and the game gets a moment to apply it before round 1 begins
 		local winners = {}
@@ -2047,7 +2054,7 @@ do
 			winners[round] = id
 			local team = round == 1 and TEAM_A_NAME or TEAM_B_NAME
 			captains[team] = { id = id, name = nameOf(id) }
-			say(string.format("%s wins captain round %d and is the %s captain!", nameOf(id), round, team))
+			say(string.format("%s is %s captain", nameOf(id), team))
 		end
 		if phase ~= "CAPTAINS" then
 			setAnonymous(false) -- same as before the duel existed: anonymous mode never stays on after the rounds
@@ -2065,7 +2072,7 @@ do
 		end
 		captainRound = 3
 		syncNow = true
-		say(string.format("Captain duel! %s and %s play a 1v1. The winner picks first.", nameOf(a), nameOf(b)))
+		say(string.format("Duel: %s vs %s", nameOf(a), nameOf(b)))
 		Act.drainUrgent()
 		local first = playCaptainRound(nil, { a, b })
 		if not first then
@@ -2073,7 +2080,7 @@ do
 			return
 		end
 		local second = first == a and b or a
-		say(string.format("%s wins the duel and picks first!", nameOf(first)))
+		say(string.format("%s picks first", nameOf(first)))
 		setAnonymous(false)
 		if phase ~= "CAPTAINS" then return end
 		runDraft(perSide, first, second)
