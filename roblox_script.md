@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.1.4" -- bump on every edit
+local SCRIPT_VERSION = "1.1.6" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -35,6 +35,9 @@ local VOTEKICK_DURATION = 10                    -- lockout minutes for a player 
 local FORFEIT_SECONDS = 180                    -- a team with nobody in the server this long forfeits the live match
 local ACTION_GAP = 1.5                          -- seconds between ANY two game remotes (kick, timeout, announce, start/stop)
 local ACTION_JITTER = 0.5                        -- extra random 0..N seconds added to every gap (gap is never below ACTION_GAP)
+local ANNOUNCE_GAP = 2.4                           -- min seconds between two announcements (the game ignores one fired while the last is still fading, ~2s)
+local ANNOUNCE_JITTER = 0.4
+local MAX_ANNOUNCE_QUEUE = 20                       -- pending announcements cap (oldest dropped)
 local function jitteredGap() return ACTION_GAP + math.random() * ACTION_JITTER end
 local REMOVE_GAP = 1.5                             -- removal events (unkick, releasing a timeout) wait at least this long, plus 0..REMOVE_JITTER
 local REMOVE_JITTER = 0.5
@@ -978,9 +981,12 @@ do
 		local args = table.pack(...)
 		push(0, tostring(args[1]), function() AnnounceEvent:FireServer(table.unpack(args, 1, args.n)) end)
 	end
+	-- Announcements get their own lane: the game ignores a SendMessage fired while the last one is still fading,
+	-- so they are spaced ANNOUNCE_GAP apart and anything that piled up meanwhile is merged into one message (nothing is dropped).
+	local announceQ, lastAnnounce = {}, 0
 	Act.announce = function(msg)
-		msg = string.sub(tostring(msg), 1, 200)
-		push(1, "announce: " .. msg, function() AnnounceEvent:FireServer("SendMessage", msg) end)
+		if #announceQ >= MAX_ANNOUNCE_QUEUE then table.remove(announceQ, 1) end
+		table.insert(announceQ, string.sub(tostring(msg), 1, 200))
 	end
 	local kickTimes = {}
 	Act.kick = function(userId, minutes)
@@ -1004,7 +1010,7 @@ do
 		local args = buildTimeoutArgs(userId, on)
 		push(urgent and 0 or 2, "timeout " .. tostring(userId) .. " " .. tostring(on), function() AnnounceEvent:FireServer(table.unpack(args)) end, not on)
 	end
-	Act.clear = function() table.clear(queue) end
+	Act.clear = function() table.clear(queue) table.clear(announceQ) end
 	Act.drain = function()
 		while Running and #queue > 0 do task.wait(0.25) end
 		task.wait(jitteredGap())
@@ -1035,6 +1041,33 @@ do
 		end
 	end)
 
+	task.spawn(function()
+		while Running do
+			if #announceQ == 0 then
+				task.wait(0.1)
+			else
+				local wait = math.max(lastAnnounce + ANNOUNCE_GAP + math.random() * ANNOUNCE_JITTER, lastFire + jitteredGap()) - os.clock()
+				if wait > 0 then
+					task.wait(wait)
+				end
+				-- merge everything that queued up while waiting (up to the 200 char limit), oldest first
+				local text = table.remove(announceQ, 1) -- nil if Act.clear() ran while waiting
+				if not text then continue end
+				while announceQ[1] and #text + 3 + #announceQ[1] <= 200 do
+					text = text .. " | " .. table.remove(announceQ, 1)
+				end
+				lastAnnounce = os.clock()
+				lastFire = lastAnnounce
+				if DRY_RUN then
+					print("[DRYRUN] announce: " .. text)
+				else
+					local ok, err = pcall(function() AnnounceEvent:FireServer("SendMessage", text) end)
+					if not ok then warn("[SCRIM] announce failed: " .. tostring(err)) end
+				end
+			end
+		end
+	end)
+
 	if not agentEnabled then return end
 
 	--// ---- state ----
@@ -1045,6 +1078,7 @@ do
 	local latched, locking = false, false
 	local lobbyFloor = 0 -- after a failed lock, wait until MORE verified players are in before re-arming
 	local announced = {}
+	local timerResetBy = {} -- [userId] = true: in the lobby when this countdown began, or already reset its timer once
 	local matchId = nil
 	local liveSince, roundSeen, startRetries = 0, false, 0
 	local matchRoster = {}   -- [userId] = { name, team } for the selected players of the current match
@@ -1158,12 +1192,18 @@ do
 	end
 
 	--// ---- verification + joins ----
-	local function onVerifiedJoin()
-		if phase == "COUNTDOWN" and not latched and not locking then
-			countdownEnds = os.clock() + cfg.countdown_seconds
-			announced = {}
-			say(string.format("Timer reset to %ds (%d/%d players)", cfg.countdown_seconds, #lobbyRoster(), LOBBY_CAP))
+	local function onVerifiedJoin(id)
+		if phase ~= "COUNTDOWN" or latched or locking then return end
+		if timerResetBy[id] then
+			-- already in the lobby (or already reset the timer) this countdown: leaving and rejoining to stall it gets them kicked
+			local p = Players:GetPlayerByUserId(id)
+			if p then kick(p, false, KICK_DURATION) end
+			return
 		end
+		timerResetBy[id] = true
+		countdownEnds = os.clock() + cfg.countdown_seconds
+		announced = {}
+		say(string.format("Timer reset to %ds (%d/%d players)", cfg.countdown_seconds, #lobbyRoster(), LOBBY_CAP))
 	end
 
 	local function applyVerified(reportedIds, verifiedList)
@@ -1172,7 +1212,7 @@ do
 		for _, id in ipairs(reportedIds) do
 			local was = verifiedCache[id]
 			verifiedCache[id] = set[id] == true
-			if verifiedCache[id] and was ~= true then onVerifiedJoin() end
+			if verifiedCache[id] and was ~= true then onVerifiedJoin(id) end
 		end
 	end
 
@@ -1691,6 +1731,8 @@ do
 		setPhase("COUNTDOWN")
 		countdownEnds = os.clock() + cfg.countdown_seconds
 		announced = {}
+		timerResetBy = {}
+		for _, p in ipairs(lobbyRoster()) do timerResetBy[p.UserId] = true end
 		latched = n >= LOBBY_CAP
 		say(string.format("Scrim starts in %ds (%d/%d players)", cfg.countdown_seconds, n, LOBBY_CAP))
 	end
