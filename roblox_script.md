@@ -197,22 +197,6 @@ do
 	local genv = getgenv and getgenv() or _G
 	if genv.ScrimUnload then pcall(genv.ScrimUnload) end -- stop an older copy before this one runs
 	genv.ScrimUnload = Unload
-	-- SetActivity is a toggle: fire it once per server on load so the bot account is not put into the match.
-	-- Keyed by JobId: getgenv() outlives teleports, so a plain flag would skip every server after the first one,
-	-- while a re-execute in the same server must not flip it back.
-	if genv.ScrimActivityJob ~= game.JobId then
-		genv.ScrimActivityJob = game.JobId
-		if DRY_RUN then
-			print("[DRY_RUN] InvokeServer SetActivity")
-		else
-			task.spawn(function() -- InvokeServer yields; never let it hold up the rest of the script
-				local ok, result = pcall(function()
-					return game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteFunction"):InvokeServer("SetActivity")
-				end)
-				print("[SCRIM] SetActivity ->", ok, tostring(result))
-			end)
-		end
-	end
 end
 
 local function makePanel(name, title, size, pos)
@@ -1118,20 +1102,8 @@ do
 
 	local function say(msg) Act.announce(msg) end
 
-	local RESET_LOCK_PHASES = { CAPTAINS = true, DRAFT = true, LIVE = true, POSTGAME = true }
-	-- "TimebombResetting" is a toggle: on while a match is running so players cannot reset.
-	-- The state is kept in getgenv() (per server) so a re-executed script does not flip a toggle it did not set.
-	local resetGenv = getgenv and getgenv() or _G
-	local resetBlocked = resetGenv.ScrimResetJob == game.JobId and resetGenv.ScrimResetBlocked == true
-	local function setResetBlocked(on)
-		if on == resetBlocked then return end
-		resetBlocked = on
-		resetGenv.ScrimResetJob, resetGenv.ScrimResetBlocked = game.JobId, on
-		Act.fireFirst("TimebombResetting")
-	end
 	local function setPhase(p)
 		phase = p
-		setResetBlocked(RESET_LOCK_PHASES[p] == true)
 		Agent.active = (p ~= "IDLE")
 		syncNow = true
 		print("[SCRIM] phase -> " .. p)
