@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.1.2" -- bump on every edit
+local SCRIPT_VERSION = "1.1.4" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -194,6 +194,18 @@ do
 	local genv = getgenv and getgenv() or _G
 	if genv.ScrimUnload then pcall(genv.ScrimUnload) end -- stop an older copy before this one runs
 	genv.ScrimUnload = Unload
+	-- SetActivity is a toggle: fire it once on the first execute so the bot account is not put into the match.
+	-- The flag survives re-executes (a second call would turn it back on).
+	if not genv.ScrimActivitySet then
+		genv.ScrimActivitySet = true
+		if DRY_RUN then
+			print("[DRY_RUN] InvokeServer SetActivity")
+		else
+			pcall(function()
+				game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteFunction"):InvokeServer("SetActivity")
+			end)
+		end
+	end
 end
 
 local function makePanel(name, title, size, pos)
@@ -1068,8 +1080,16 @@ do
 
 	local function say(msg) Act.announce(msg) end
 
+	local RESET_LOCK_PHASES = { CAPTAINS = true, DRAFT = true, LIVE = true, POSTGAME = true }
+	local resetBlocked = false -- "TimebombResetting" is a toggle: on while a match is running so players cannot reset
+	local function setResetBlocked(on)
+		if on == resetBlocked then return end
+		resetBlocked = on
+		Act.fireFirst("TimebombResetting")
+	end
 	local function setPhase(p)
 		phase = p
+		setResetBlocked(RESET_LOCK_PHASES[p] == true)
 		Agent.active = (p ~= "IDLE")
 		syncNow = true
 		print("[SCRIM] phase -> " .. p)
