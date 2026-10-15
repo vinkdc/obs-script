@@ -201,7 +201,7 @@ do
 		if DRY_RUN then
 			print("[DRY_RUN] InvokeServer SetActivity")
 		else
-			pcall(function()
+			task.spawn(pcall, function() -- InvokeServer yields; never let it hold up the rest of the script
 				game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteFunction"):InvokeServer("SetActivity")
 			end)
 		end
