@@ -418,18 +418,18 @@ local function checkRoundWinner()
 
 	RoundDecided = true
 	SeriesScore[roundWinner] += 1
-	-- moments the bot announces in Discord. Ace: one player killed the whole other team (4v4 and 5v5 only).
+	-- moments the bot announces in Discord. Ace: one player killed a full other team's worth of players, i.e. 5 in 5v5 (5v5 only; enemies who left don't count).
 	-- Clutch: the last player alive beat 3 or more enemies. Flawless: the team won without losing a player (both from 3v3 up).
 	local participants = {}
 	for name in pairs(roundParticipants) do
 		local t = PlayerTeams[name]
 		if t then participants[t] = (participants[t] or 0) + 1 end
 	end
-	if SeriesPerSide >= 4 then
+	if SeriesPerSide >= 5 then
 		for killer, n in pairs(roundKills) do
 			local team = PlayerTeams[killer]
 			local enemy = team == TEAM_A_NAME and TEAM_B_NAME or TEAM_A_NAME
-			if team == roundWinner and n >= (participants[enemy] or math.huge) then
+			if team == roundWinner and n >= SeriesPerSide and n >= (participants[enemy] or math.huge) then -- enemies who left don't shrink the target
 				ensureStats(killer).Aces += 1
 				if Agent.onMoment then Agent.onMoment("ace", killer, team) end
 			end
