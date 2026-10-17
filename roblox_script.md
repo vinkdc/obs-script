@@ -47,6 +47,8 @@ local KICK_JITTER = 0.5
 local UNKICK_DELAY_SECONDS = 30                  -- after the match ends and everyone is kicked, wait this long, then unkick them one by one
 local MAX_QUEUE = 60                             -- pending remotes cap: a runaway loop can't grow the queue (and the sort per push) forever
 local MAX_BOMB_HISTORY = 20                      -- bomb-holder chain cap
+local FUSE_SECONDS = 10                          -- the bomb always explodes 10s after the fuse resets (every explosion)
+local HOT_PASS_WINDOW = 2                        -- a pass to an enemy with this many seconds or less left on the fuse is a hot pass
 local MAX_PENDING_FINALS = 10                    -- unacked match results kept while the bot is unreachable
 local MAX_KICKS_PER_MINUTE = 25                 -- safety valve: a bug can never mass-kick the server
 -- Staff / spectator accounts the script must never count, kick or time out: [userId] = true
@@ -147,11 +149,50 @@ local deathClock = {}              -- { ["PlayerName"] = os.clock() } of this ro
 local roundParticipants = {}    -- { ["PlayerName"] = true } snapshot at round start
 local BombHistory = {}          -- ordered list of bomb holders since last explosion
 local LastBombHolderName = nil
+local fuseStart = nil           -- os.clock() when the first holder after the last explosion got the bomb
+local heldSince = nil           -- os.clock() when the current holder got the bomb
+local roundFirstOut = false     -- true once someone has died this round
 local Running = true
 
+-- RoundsPlayed / RoundsSurvived: decided rounds this player started, and was still alive at the end of.
+-- HoldMs / Holds: total time holding the bomb, and how many times. FirstOuts: rounds where this player died first.
+local STAT_KEYS = { "Kills", "Deaths", "Assists", "TeamKills", "Aces", "Clutches", "RoundsPlayed", "RoundsSurvived", "HoldMs", "Holds", "HotPasses", "FirstOuts" }
+
+local function copyStat(s)
+	local out = {}
+	for _, k in ipairs(STAT_KEYS) do out[k] = (s and s[k]) or 0 end
+	return out
+end
+
 local function ensureStats(name)
-	if not MatchStats[name] then MatchStats[name] = { Kills = 0, Deaths = 0, Assists = 0, TeamKills = 0, Aces = 0, Clutches = 0 } end
+	if not MatchStats[name] then MatchStats[name] = copyStat(nil) end
 	return MatchStats[name]
+end
+
+-- close the current holder's hold (on a pass or an explosion)
+local function endHold(name, now)
+	if not (SeriesActive and name and heldSince) then return end
+	local s = ensureStats(name)
+	s.HoldMs += math.floor((now - heldSince) * 1000 + 0.5)
+	s.Holds += 1
+end
+
+-- a new bomb holder: closes the last holder's hold and counts a hot pass to an enemy
+local function noteHolder(name)
+	local now = os.clock()
+	local prev = BombHistory[#BombHistory]
+	if prev then
+		endHold(prev, now)
+		local t1, t2 = PlayerTeams[prev], PlayerTeams[name]
+		if SeriesActive and fuseStart and t1 and t2 and t1 ~= t2 and FUSE_SECONDS - (now - fuseStart) <= HOT_PASS_WINDOW then
+			ensureStats(prev).HotPasses += 1
+		end
+	else
+		fuseStart = now -- first holder since the explosion: the fuse just reset
+	end
+	heldSince = now
+	table.insert(BombHistory, name)
+	if #BombHistory > MAX_BOMB_HISTORY then table.remove(BombHistory, 1) end
 end
 
 local function printStats()
@@ -418,6 +459,13 @@ local function checkRoundWinner()
 
 	RoundDecided = true
 	SeriesScore[roundWinner] += 1
+	for name in pairs(roundParticipants) do
+		if PlayerTeams[name] then
+			local s = ensureStats(name)
+			s.RoundsPlayed += 1
+			if not deadPlayersThisRound[name] and Players:FindFirstChild(name) then s.RoundsSurvived += 1 end
+		end
+	end
 	-- moments the bot announces in Discord. Ace: one player killed a full other team's worth of players, i.e. 5 in 5v5 (5v5 only; enemies who left don't count).
 	-- Clutch: the last player alive beat 3 or more enemies. Flawless: the team won without losing a player (both from 3v3 up).
 	local participants = {}
@@ -585,6 +633,11 @@ local function processPendingDeaths()
 		end
 	end
 
+	if not roundFirstOut and batch[1] and SeriesActive then
+		roundFirstOut = true
+		ensureStats(batch[1]).FirstOuts += 1
+	end
+
 	local credited = {}
 	for _, victim in ipairs(batch) do
 		local killer
@@ -649,6 +702,8 @@ local function handleDeath(victimName)
 
 	-- snapshot the bomb chain at the exact moment of death
 	if not pendingBomb and BombHistory[#BombHistory] == victimName then
+		endHold(victimName, os.clock())
+		heldSince, fuseStart = nil, nil
 		pendingBomb = resolveBombCredit(BombHistory)
 		LastBombHolderName = victimName
 		BombHistory = {}
@@ -783,8 +838,7 @@ local function setupPlayerTracker(player)
 				and humanoid.Health > 0
 				and not deadPlayersThisRound[player.Name]
 				and BombHistory[#BombHistory] ~= player.Name then
-				table.insert(BombHistory, player.Name)
-				if #BombHistory > MAX_BOMB_HISTORY then table.remove(BombHistory, 1) end
+				noteHolder(player.Name)
 				print("[BOMB TRACKER] " .. player.Name .. " now holds the bomb (chain size " .. #BombHistory .. ")")
 			end
 		end
@@ -844,6 +898,7 @@ local function beginRound()
 	pendingBomb = nil
 	BombHistory = {}
 	LastBombHolderName = nil
+	fuseStart, heldSince, roundFirstOut = nil, nil, false
 	snapshotParticipants()
 	print("[ROUND START]")
 
@@ -855,7 +910,7 @@ local function beginRound()
 			if p.Character and roundParticipants[p.Name] then
 				local held = getHeldObject(p.Character)
 				if held and string.find(string.lower(held.Name), "bomb") and BombHistory[#BombHistory] ~= p.Name then
-					table.insert(BombHistory, p.Name)
+					noteHolder(p.Name)
 					print("[BOMB TRACKER] Initial bomb holder: " .. p.Name)
 				end
 			end
@@ -1139,7 +1194,7 @@ do
 
 	local function copyStats(stats)
 		local out = {}
-		for name, s in pairs(stats) do out[name] = { Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, TeamKills = s.TeamKills or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0 } end
+		for name, s in pairs(stats) do out[name] = copyStat(s) end
 		return out
 	end
 
@@ -1308,8 +1363,9 @@ do
 		local stats = {}
 		if phase == "LIVE" then
 			for id, info in pairs(matchRoster) do
-				local s = MatchStats[info.name] or { Kills = 0, Deaths = 0, Assists = 0, TeamKills = 0, Aces = 0, Clutches = 0 }
-				table.insert(stats, { UserId = id, Name = info.name, Team = info.team, Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, TeamKills = s.TeamKills or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0 })
+				local row = copyStat(MatchStats[info.name])
+				row.UserId, row.Name, row.Team = id, info.name, info.team
+				table.insert(stats, row)
 			end
 		end
 		local timed = {}
@@ -1459,7 +1515,7 @@ do
 				PlayerTeams[s.Name] = s.Team
 				nameById[id], lockedIds[id] = s.Name, true
 				table.insert(teamOrder[s.Team], id)
-				MatchStats[s.Name] = { Kills = s.Kills or 0, Deaths = s.Deaths or 0, Assists = s.Assists or 0, TeamKills = s.TeamKills or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0 }
+				MatchStats[s.Name] = copyStat(s)
 				if s.Team == TEAM_A_NAME then perSide += 1 end
 				local pl = Players:GetPlayerByUserId(id)
 				if pl then updatePlayerNametag(pl) else leftAt[id] = os.clock() end -- not in the server right now: may rejoin
@@ -1625,9 +1681,10 @@ do
 			stats = {},
 		}
 		for id, info in pairs(matchRoster) do
-			local s = stats[info.name] or { Kills = 0, Deaths = 0, Assists = 0, TeamKills = 0, Aces = 0, Clutches = 0 }
-			table.insert(final.stats, { UserId = id, Name = info.name, Team = info.team, Kills = s.Kills, Deaths = s.Deaths, Assists = s.Assists, TeamKills = s.TeamKills or 0, Aces = s.Aces or 0, Clutches = s.Clutches or 0,
-				Left = leftAt[id] ~= nil and not voteKicked[id], Kicked = voteKicked[id] == true })
+			local row = copyStat(stats[info.name])
+			row.UserId, row.Name, row.Team = id, info.name, info.team
+			row.Left, row.Kicked = leftAt[id] ~= nil and not voteKicked[id], voteKicked[id] == true
+			table.insert(final.stats, row)
 		end
 		table.insert(pendingFinals, final)
 		while #pendingFinals > MAX_PENDING_FINALS do table.remove(pendingFinals, 1) end
