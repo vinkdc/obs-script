@@ -473,11 +473,13 @@ local function checkRoundWinner()
 		local t = PlayerTeams[name]
 		if t then participants[t] = (participants[t] or 0) + 1 end
 	end
+	local aced = {}
 	if SeriesPerSide >= 5 then
 		for killer, n in pairs(roundKills) do
 			local team = PlayerTeams[killer]
 			local enemy = team == TEAM_A_NAME and TEAM_B_NAME or TEAM_A_NAME
 			if team == roundWinner and n >= SeriesPerSide and n >= (participants[enemy] or math.huge) then -- enemies who left don't shrink the target
+				aced[killer] = true
 				ensureStats(killer).Aces += 1
 				if Agent.onMoment then Agent.onMoment("ace", killer, team) end
 			end
@@ -487,7 +489,17 @@ local function checkRoundWinner()
 		local seed = clutchSeed[roundWinner]
 		if seed and seed.enemies >= 3 and not deadPlayersThisRound[seed.name] then
 			ensureStats(seed.name).Clutches += 1
-			Agent.onMoment("clutch", seed.name, roundWinner, seed.enemies)
+			-- 1 vs the whole enemy team (1v5 in 5v5) is an ace too: after an explosion the bomb respawns on a random player and
+			-- enemies sac each other, so those deaths never credit the survivor's roundKills even though they outlasted all five
+			local enemy = roundWinner == TEAM_A_NAME and TEAM_B_NAME or TEAM_A_NAME
+			if SeriesPerSide >= 5 and seed.enemies >= SeriesPerSide and seed.enemies >= (participants[enemy] or math.huge) then
+				if not aced[seed.name] then
+					ensureStats(seed.name).Aces += 1
+					Agent.onMoment("ace", seed.name, roundWinner)
+				end
+			else
+				Agent.onMoment("clutch", seed.name, roundWinner, seed.enemies)
+			end
 		end
 		if participants[roundWinner] and getAliveCount(roundWinner) == participants[roundWinner] then
 			Agent.onMoment("flawless", nil, roundWinner)
