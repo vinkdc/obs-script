@@ -48,7 +48,7 @@ local UNKICK_DELAY_SECONDS = 30                  -- after the match ends and eve
 local MAX_QUEUE = 60                             -- pending remotes cap: a runaway loop can't grow the queue (and the sort per push) forever
 local MAX_BOMB_HISTORY = 20                      -- bomb-holder chain cap
 local FUSE_SECONDS = 10                          -- the bomb always explodes 10s after the fuse resets (every explosion)
-local HOT_PASS_WINDOW = 2                        -- a pass to an enemy with this many seconds or less left on the fuse is a hot pass
+local HOT_PASS_WINDOW = 2                        -- receiving the bomb with this many seconds or less left on the fuse and passing it to an enemy is a hot pass (late track)
 local MAX_PENDING_FINALS = 10                    -- unacked match results kept while the bot is unreachable
 local MAX_KICKS_PER_MINUTE = 25                 -- safety valve: a bug can never mass-kick the server
 -- Staff / spectator accounts the script must never count, kick or time out: [userId] = true
@@ -177,14 +177,14 @@ local function endHold(name, now)
 	s.Holds += 1
 end
 
--- a new bomb holder: closes the last holder's hold and counts a hot pass to an enemy
+-- a new bomb holder: closes the last holder's hold and counts a hot pass if they got it late and passed it to an enemy
 local function noteHolder(name)
 	local now = os.clock()
 	local prev = BombHistory[#BombHistory]
 	if prev then
 		endHold(prev, now)
 		local t1, t2 = PlayerTeams[prev], PlayerTeams[name]
-		if SeriesActive and fuseStart and t1 and t2 and t1 ~= t2 and FUSE_SECONDS - (now - fuseStart) <= HOT_PASS_WINDOW then
+		if SeriesActive and fuseStart and t1 and t2 and t1 ~= t2 and heldSince and FUSE_SECONDS - (heldSince - fuseStart) <= HOT_PASS_WINDOW then
 			ensureStats(prev).HotPasses += 1
 		end
 	else
