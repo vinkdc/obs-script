@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.1.11" -- bump on every edit
+local SCRIPT_VERSION = "1.1.12" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -2345,8 +2345,8 @@ do
 			end
 		end
 		local aGone, bGone = absentFor(TEAM_A_NAME) >= FORFEIT_SECONDS, absentFor(TEAM_B_NAME) >= FORFEIT_SECONDS
-		if aGone and bGone then
-			-- everyone left: no winner. The bot logs this as an aborted match.
+		if inServer[TEAM_A_NAME] == 0 and inServer[TEAM_B_NAME] == 0 then
+			-- everyone left: end now, no grace period and no winner. The bot logs this as an aborted match.
 			SeriesActive = false
 			stopRound()
 			resetAll()
