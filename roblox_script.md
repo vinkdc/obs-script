@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.1.10" -- bump on every edit
+local SCRIPT_VERSION = "1.1.11" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -153,6 +153,76 @@ local fuseStart = nil           -- os.clock() when the first holder after the la
 local heldSince = nil           -- os.clock() when the current holder got the bomb
 local roundFirstOut = false     -- true once someone has died this round
 local Running = true
+
+--// ROUND TIMELINE: sent with the final so the site can show each round (validated by the bot's clean_timeline).
+--// Times are ms since the round started. Players are UserIds (names change); 0 = nobody.
+local TIMELINE_MAX_ROUNDS, TIMELINE_MAX_DEATHS, TIMELINE_MAX_EVENTS = 40, 20, 60
+local Timeline = nil        -- { v = 1, rounds = {}, events = {}, truncated = bool } while a match is live
+local TimelineRound = nil   -- { n, t0, deaths } for the round being played
+local timelineIds = {}      -- [name] = UserId, remembered so players who left still resolve
+
+local function timelineReset(truncated)
+	Timeline = { v = 1, rounds = {}, events = {}, truncated = truncated == true }
+	TimelineRound, timelineIds = nil, {}
+end
+
+local function timelineId(name)
+	if not name then return 0 end
+	local p = Players:FindFirstChild(name)
+	if p and p:IsA("Player") then timelineIds[name] = p.UserId end
+	return timelineIds[name] or 0
+end
+
+local function timelineMs(clock)
+	if not TimelineRound then return 0 end
+	return math.max(0, math.floor(((clock or os.clock()) - TimelineRound.t0) * 1000))
+end
+
+local function timelineRoundStart()
+	if not (Timeline and SeriesActive) then return end
+	TimelineRound = { n = #Timeline.rounds + 1, t0 = os.clock(), deaths = {} }
+	for name in pairs(roundParticipants) do timelineId(name) end -- remember ids now, in case someone leaves mid-round
+end
+
+-- one row per victim: { ms, { victimId }, killerId, assisterId, teamKill }
+local function timelineDeath(victim, killer, assister, teamKill)
+	if not (Timeline and TimelineRound) then return end
+	if #TimelineRound.deaths >= TIMELINE_MAX_DEATHS then Timeline.truncated = true return end
+	table.insert(TimelineRound.deaths, { timelineMs(deathClock[victim]), { timelineId(victim) }, timelineId(killer), timelineId(assister), teamKill and 1 or 0 })
+end
+
+local function timelineRoundEnd(winner, tiebreak)
+	if not (Timeline and TimelineRound) then return end
+	if #Timeline.rounds >= TIMELINE_MAX_ROUNDS then Timeline.truncated = true TimelineRound = nil return end
+	local players = {}
+	for name in pairs(roundParticipants) do
+		local id = timelineId(name)
+		if id > 0 then table.insert(players, id) end
+	end
+	table.insert(Timeline.rounds, {
+		n = TimelineRound.n,
+		winner = winner, -- nil = draw, replayed without a point
+		score = { SeriesScore[TEAM_A_NAME], SeriesScore[TEAM_B_NAME] },
+		ms = timelineMs(),
+		tiebreak = tiebreak == true,
+		players = players,
+		deaths = TimelineRound.deaths,
+	})
+	TimelineRound = nil
+end
+
+-- kind: "leave" | "rejoin" | "votekick" | "assign"
+local function timelineEvent(kind, userId, extra)
+	if not Timeline or type(userId) ~= "number" or userId <= 0 then return end
+	if #Timeline.events >= TIMELINE_MAX_EVENTS then Timeline.truncated = true return end
+	local n = TimelineRound and TimelineRound.n or (#Timeline.rounds + 1)
+	table.insert(Timeline.events, { n, timelineMs(), kind, userId, extra })
+end
+
+local function timelineExport()
+	if not Timeline or (#Timeline.rounds == 0 and #Timeline.events == 0) then return nil end
+	return { v = 1, rounds = Timeline.rounds, events = Timeline.events, truncated = Timeline.truncated }
+end
 
 -- RoundsPlayed / RoundsSurvived: decided rounds this player started, and was still alive at the end of.
 -- HoldMs / Holds: total time holding the bomb, and how many times. FirstOuts: rounds where this player died first.
@@ -438,12 +508,14 @@ local function checkRoundWinner()
 	if aliveA > 0 and aliveB > 0 then return end
 
 	local roundWinner = nil
+	local tiebreak = false
 	if aliveA == 0 and aliveB > 0 then
 		roundWinner = TEAM_B_NAME
 	elseif aliveB == 0 and aliveA > 0 then
 		roundWinner = TEAM_A_NAME
 	else
 		-- both wiped at once: team that held the bomb last loses
+		tiebreak = true
 		if LastBombHolderName then
 			local bombTeam = PlayerTeams[LastBombHolderName]
 			if bombTeam == TEAM_A_NAME then roundWinner = TEAM_B_NAME
@@ -452,6 +524,7 @@ local function checkRoundWinner()
 		if not roundWinner then
 			broadcastMessage("Round ended in a draw!")
 			RoundDecided = true
+			timelineRoundEnd(nil, false)
 			task.spawn(startNextRound)
 			return
 		end
@@ -459,6 +532,7 @@ local function checkRoundWinner()
 
 	RoundDecided = true
 	SeriesScore[roundWinner] += 1
+	timelineRoundEnd(roundWinner, tiebreak) -- before onSeriesOver below, which sends the timeline
 	for name in pairs(roundParticipants) do
 		if PlayerTeams[name] then
 			local s = ensureStats(name)
@@ -651,6 +725,7 @@ local function processPendingDeaths()
 	end
 
 	local credited = {}
+	local assistLogged = false -- the stats count the assist once per explosion; log it on the first row only
 	for _, victim in ipairs(batch) do
 		local killer
 		if koTracking then
@@ -671,6 +746,12 @@ local function processPendingDeaths()
 				end
 			end
 			credited[killer] = true
+		end
+		do -- same killer/assist rules as the stats above, so the timeline always matches the totals
+			local teamKill = killer ~= nil and PlayerTeams[killer] ~= nil and PlayerTeams[killer] == PlayerTeams[victim]
+			local assister = not assistLogged and bomb and killer and bomb.killer == killer and not bomb.teamKill and bomb.assisters[1] or nil
+			if assister then assistLogged = true end
+			timelineDeath(victim, killer, assister, teamKill)
 		end
 		print(string.format("[DEATH] %s(%s) killed by %s", victim, tostring(PlayerTeams[victim] or "?"), tostring(killer)))
 		announceKill(victim, killer)
@@ -912,6 +993,7 @@ local function beginRound()
 	LastBombHolderName = nil
 	fuseStart, heldSince, roundFirstOut = nil, nil, false
 	snapshotParticipants()
+	timelineRoundStart()
 	print("[ROUND START]")
 
 	-- catch late team changes + the initial bomb holder
@@ -1536,6 +1618,7 @@ do
 		for _, id in ipairs(r.timed_out or {}) do timedOut[id] = true end
 		SeriesPerSide = math.max(perSide, 1)
 		SeriesActive = true
+		timelineReset(true) -- rounds before the restart were not recorded
 		liveSince, roundSeen, startRetries = os.clock(), false, 0
 		absentSince, absentWarned = {}, {}
 		setPhase("LIVE")
@@ -1572,6 +1655,7 @@ do
 		if not info then return end
 		voteKicked[id] = true
 		leftAt[id] = nil
+		timelineEvent("votekick", id)
 		leftIds[id] = true -- the enforce loop benches and kicks them again if they return before the match ends
 		PlayerTeams[info.name] = nil
 		say(string.format("%s was vote-kicked from %s.", info.name, info.team))
@@ -1691,6 +1775,7 @@ do
 			forfeit = forfeit,
 			rounds = a + b,
 			stats = {},
+			timeline = timelineExport(),
 		}
 		for id, info in pairs(matchRoster) do
 			local row = copyStat(stats[info.name])
@@ -1767,6 +1852,7 @@ do
 		lockedIds[id], leftIds[id], nameById[id] = true, nil, p.Name
 		matchRoster[id] = { name = p.Name, team = team }
 		PlayerTeams[p.Name] = team
+		if phase == "LIVE" then timelineEvent("assign", id, team) end
 		ensureStats(p.Name)
 		updatePlayerNametag(p)
 		releaseTimeout(id, true)
@@ -1797,6 +1883,7 @@ do
 		SeriesScore = { [TEAM_A_NAME] = 0, [TEAM_B_NAME] = 0 }
 		SeriesActive = true
 		MatchStats = {}
+		timelineReset()
 		for _, info in pairs(matchRoster) do ensureStats(info.name) end
 		liveSince, roundSeen, startRetries = os.clock(), false, 0
 		absentSince, absentWarned = {}, {}
@@ -2291,6 +2378,7 @@ do
 
 	Players.PlayerAdded:Connect(function(p)
 		verifiedCache[p.UserId] = nil -- re-check; they may have verified since last time
+		if leftAt[p.UserId] and phase == "LIVE" then timelineEvent("rejoin", p.UserId) end
 		leftAt[p.UserId] = nil -- back within the grace period
 		kickedUnverified[p.UserId] = nil
 		if releaseOnJoin[p.UserId] then
@@ -2303,6 +2391,7 @@ do
 		if lockedIds[p.UserId] and (phase == "CAPTAINS" or phase == "DRAFT" or phase == "LIVE" or phase == "POSTGAME") then
 			if not voteKicked[p.UserId] then
 				leftAt[p.UserId] = os.clock()
+				if phase == "LIVE" then timelineEvent("leave", p.UserId) end
 				print("[SCRIM] " .. p.Name .. " disconnected; they can rejoin until the match ends")
 			end
 		end
