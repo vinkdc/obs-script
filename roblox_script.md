@@ -15,7 +15,7 @@ local SCRIPT_VERSION = "1.1.12" -- bump on every edit
 local PLAYING_TEAM_NAME = "Playing"
 local TEAM_A_NAME = "Black"
 local TEAM_B_NAME = "White"
--- first to 7 (up to 3v3) or 11 (4v4 to 8v8), win by 2; the match end is decided by Rules.isMatchOver
+-- first to 7 (up to 3v3) or 11 (4v4 and 5v5), win by 2; the match end is decided by Rules.isMatchOver
 
 --// =========================================================
 --// SCRIM SETTINGS (fill these in)
@@ -72,10 +72,7 @@ local function buildTimeoutArgs(userId, on)
 end
 
 --// Rules (mirror of core/services/scrim_rules.py; vectors are self-checked below)
--- hard cap = points to win + CAP_OVER. MULTI_FROM: 7v7 and up play "Shrink" + "Multi" (several bombs at once) to keep big
--- lobbies short. ACE_KILLS: an ace = this many enemy kills in one round (5v5 and up).
--- (The main chunk is near Luau's local-variable limit: add new settings as fields, not new top-level locals.)
-local Rules = { WIN_BY = 2, CAP_OVER = 3, MAX_PER_TEAM = 8, MULTI_FROM = 7, ACE_KILLS = 5 }
+local Rules = { WIN_BY = 2, CAP_OVER = 3, MAX_PER_TEAM = 5 } -- hard cap = points to win + CAP_OVER
 
 function Rules.pointsToWin(perSide)
 	return perSide >= 4 and 11 or 7
@@ -93,12 +90,6 @@ function Rules.isGamePoint(a, b, perSide, team)
 	if Rules.isMatchOver(a, b, perSide) then return false end
 	if team == "A" then return Rules.isMatchOver(a + 1, b, perSide) end
 	return Rules.isMatchOver(a, b + 1, perSide)
-end
-
--- seconds a captain has per pick: 15 from 6v6 up (7 picks each in 8v8), the configured time below that
-function Rules.pickSeconds(base, perSide)
-	if perSide >= 6 then return math.min(base, 15) end
-	return base
 end
 
 function Rules.teamSize(playerCount, minPlayers)
@@ -129,7 +120,7 @@ assert(not Rules.isMatchOver(7, 6, 2) and Rules.isMatchOver(8, 6, 2) and not Rul
 assert(not Rules.isMatchOver(9, 9, 2) and Rules.isMatchOver(10, 9, 2) and Rules.isMatchOver(9, 10, 3))
 assert(not Rules.isMatchOver(10, 0, 4) and Rules.isMatchOver(11, 0, 4) and Rules.isMatchOver(11, 9, 5))
 assert(not Rules.isMatchOver(11, 10, 4) and Rules.isMatchOver(12, 10, 4) and not Rules.isMatchOver(13, 13, 5) and Rules.isMatchOver(14, 13, 5))
-assert(Rules.teamSize(5, 6) == 0 and Rules.teamSize(6, 6) == 3 and Rules.teamSize(9, 6) == 4 and Rules.teamSize(14, 6) == 7 and Rules.teamSize(19, 6) == 8)
+assert(Rules.teamSize(5, 6) == 0 and Rules.teamSize(6, 6) == 3 and Rules.teamSize(9, 6) == 4 and Rules.teamSize(14, 6) == 5)
 
 --// Action facade. Replaced by a rate-limited queue in the SCRIM AGENT section at the bottom.
 local Act = {
@@ -156,11 +147,10 @@ local roundKills = {}                  -- { ["PlayerName"] = enemy kills this ro
 local clutchSeed = {}                  -- { [team] = { name, enemies } } the moment a team was down to one player, and how many enemies were still alive
 local deathClock = {}              -- { ["PlayerName"] = os.clock() } of this round's deaths
 local roundParticipants = {}    -- { ["PlayerName"] = true } snapshot at round start
--- one chain per live bomb (Multi has several): { names = holders in order since its last explosion,
--- fuseStart = os.clock() when its first holder got it, heldSince = os.clock() when its current holder got it }
--- multi = the current bomb round is "Multi"
-local Bombs = { chains = {}, multi = false }
+local BombHistory = {}          -- ordered list of bomb holders since last explosion
 local LastBombHolderName = nil
+local fuseStart = nil           -- os.clock() when the first holder after the last explosion got the bomb
+local heldSince = nil           -- os.clock() when the current holder got the bomb
 local roundFirstOut = false     -- true once someone has died this round
 local Running = true
 
@@ -249,93 +239,30 @@ local function ensureStats(name)
 	return MatchStats[name]
 end
 
--- the StartMinigame mode args for a match of perSide players a side (also tells the bomb tracker how many bombs to expect)
-function Bombs.modeArgs(perSide)
-	Bombs.multi = perSide >= Rules.MULTI_FROM
-	if Bombs.multi then return "Shrink", "Multi" end
-	return "LeagueStandard", "Normal"
-end
-
 -- close the current holder's hold (on a pass or an explosion)
-local function endHold(name, chain, now)
-	if not (SeriesActive and name and chain.heldSince) then return end
+local function endHold(name, now)
+	if not (SeriesActive and name and heldSince) then return end
 	local s = ensureStats(name)
-	s.HoldMs += math.floor((now - chain.heldSince) * 1000 + 0.5)
+	s.HoldMs += math.floor((now - heldSince) * 1000 + 0.5)
 	s.Holds += 1
 end
 
-local getHeldObject -- defined with the nametags below
-
--- the chain of the bomb this player holds (or held last, while it is passed on)
-function Bombs.chainOf(name)
-	for _, c in ipairs(Bombs.chains) do
-		if c.names[#c.names] == name then return c end
-	end
-	return nil
-end
-
-function Bombs.holds(name)
-	local p = Players:FindFirstChild(name)
-	local held = p and p.Character and getHeldObject(p.Character)
-	return held ~= nil and string.find(string.lower(held.Name), "bomb") ~= nil
-end
-
-function Bombs.rootPos(name)
-	local p = Players:FindFirstChild(name)
-	local root = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
-	return root and root.Position
-end
-
--- Multi: a pass is a touch, so the bomb came from the nearest previous holder who no longer has one.
--- Chains past their fuse have exploded (or vanished) and are dropped. nil = a fresh bomb.
-function Bombs.adopt(name, now)
-	local here, best, bestDist = Bombs.rootPos(name), nil, math.huge
-	for i = #Bombs.chains, 1, -1 do
-		local c = Bombs.chains[i]
-		local last = c.names[#c.names]
-		if now - c.fuseStart > FUSE_SECONDS + 1 then
-			table.remove(Bombs.chains, i)
-		elseif last ~= name and not Bombs.holds(last) then
-			local there = Bombs.rootPos(last)
-			local d = (here and there) and (here - there).Magnitude or 1e6
-			if d < bestDist then best, bestDist = c, d end
-		end
-	end
-	return best
-end
-
 -- a new bomb holder: closes the last holder's hold and counts a hot pass if they got it late and passed it to an enemy
-local function noteHolder(name, at, retried)
-	if Bombs.chainOf(name) then return end
-	local now = at or os.clock()
-	local c
-	if Bombs.multi then
-		c = Bombs.adopt(name, now)
-		if not c and not retried and #Bombs.chains > 0 then
-			-- the passer's bomb may not be gone yet on our side: look again in a moment before calling it a new bomb
-			task.delay(0.25, function()
-				if RoundActive and not deadPlayersThisRound[name] and Bombs.holds(name) then noteHolder(name, now, true) end
-			end)
-			return
-		end
-	else
-		c = Bombs.chains[1] -- one bomb: every new holder got it from the last one
-	end
-	if c then
-		local prev = c.names[#c.names]
-		endHold(prev, c, now)
+local function noteHolder(name)
+	local now = os.clock()
+	local prev = BombHistory[#BombHistory]
+	if prev then
+		endHold(prev, now)
 		local t1, t2 = PlayerTeams[prev], PlayerTeams[name]
-		if SeriesActive and t1 and t2 and t1 ~= t2 and c.heldSince and FUSE_SECONDS - (c.heldSince - c.fuseStart) <= HOT_PASS_WINDOW then
+		if SeriesActive and fuseStart and t1 and t2 and t1 ~= t2 and heldSince and FUSE_SECONDS - (heldSince - fuseStart) <= HOT_PASS_WINDOW then
 			ensureStats(prev).HotPasses += 1
 		end
 	else
-		c = { names = {}, fuseStart = now } -- first holder since an explosion: the fuse just reset
-		table.insert(Bombs.chains, c)
+		fuseStart = now -- first holder since the explosion: the fuse just reset
 	end
-	c.heldSince = now
-	table.insert(c.names, name)
-	if #c.names > MAX_BOMB_HISTORY then table.remove(c.names, 1) end
-	print("[BOMB TRACKER] " .. name .. " now holds a bomb (chain size " .. #c.names .. ", bombs " .. #Bombs.chains .. ")")
+	heldSince = now
+	table.insert(BombHistory, name)
+	if #BombHistory > MAX_BOMB_HISTORY then table.remove(BombHistory, 1) end
 end
 
 local function printStats()
@@ -554,7 +481,7 @@ local function startNextRound()
 	if not SeriesActive then return end -- the match ended (forfeit, /scrim stop) while we waited: no new round
 	if Agent.beforeRound then Agent.beforeRound() end -- bench latecomers before the next bomb round
 	if not SeriesActive then return end -- clearing the field can take up to 30s
-	Act.fire("StartMinigame", "Timebomb", Bombs.modeArgs(SeriesPerSide))
+	Act.fire("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
 	print("[GAMELOOP] Next round started")
 
 	-- If the server never emptied the Playing team, force a fresh round state
@@ -613,7 +540,7 @@ local function checkRoundWinner()
 			if not deadPlayersThisRound[name] and Players:FindFirstChild(name) then s.RoundsSurvived += 1 end
 		end
 	end
-	-- moments the bot announces in Discord. Ace: one player killed 5 enemies in the round, from 5v5 up.
+	-- moments the bot announces in Discord. Ace: one player killed a full other team's worth of players, i.e. 5 in 5v5 (5v5 only; enemies who left don't count).
 	-- Clutch: the last player alive beat 3 or more enemies. Flawless: the team won without losing a player (both from 3v3 up).
 	local participants = {}
 	for name in pairs(roundParticipants) do
@@ -624,7 +551,8 @@ local function checkRoundWinner()
 	if SeriesPerSide >= 5 then
 		for killer, n in pairs(roundKills) do
 			local team = PlayerTeams[killer]
-			if team == roundWinner and n >= Rules.ACE_KILLS then
+			local enemy = team == TEAM_A_NAME and TEAM_B_NAME or TEAM_A_NAME
+			if team == roundWinner and n >= SeriesPerSide and n >= (participants[enemy] or math.huge) then -- enemies who left don't shrink the target
 				aced[killer] = true
 				ensureStats(killer).Aces += 1
 				if Agent.onMoment then Agent.onMoment("ace", killer, team) end
@@ -635,9 +563,10 @@ local function checkRoundWinner()
 		local seed = clutchSeed[roundWinner]
 		if seed and seed.enemies >= 3 and not deadPlayersThisRound[seed.name] then
 			ensureStats(seed.name).Clutches += 1
-			-- 1 vs 5 or more is an ace too: after an explosion the bomb respawns on a random player and
-			-- enemies sac each other, so those deaths never credit the survivor's roundKills even though they outlasted them all
-			if SeriesPerSide >= 5 and seed.enemies >= Rules.ACE_KILLS then
+			-- 1 vs the whole enemy team (1v5 in 5v5) is an ace too: after an explosion the bomb respawns on a random player and
+			-- enemies sac each other, so those deaths never credit the survivor's roundKills even though they outlasted all five
+			local enemy = roundWinner == TEAM_A_NAME and TEAM_B_NAME or TEAM_A_NAME
+			if SeriesPerSide >= 5 and seed.enemies >= SeriesPerSide and seed.enemies >= (participants[enemy] or math.huge) then
 				if not aced[seed.name] then
 					ensureStats(seed.name).Aces += 1
 					Agent.onMoment("ace", seed.name, roundWinner)
@@ -679,8 +608,8 @@ end
 --// DEATH + KILL CREDIT
 --// =========================================================
 -- How credit works:
---  * Each live bomb has a chain (Bombs.chains): the ordered list of players who held it since its last explosion.
---  * The moment a bomb's CURRENT holder dies, we snapshot that chain and drop it,
+--  * BombHistory is the ordered list of players who held the bomb since the last explosion.
+--  * The moment the CURRENT bomb holder dies, we snapshot the chain and reset BombHistory,
 --    so a new bomb / dead-player tool events can't pollute it.
 --  * Killer = the player who passed the bomb last. If the victim is their teammate it is a team kill (TeamKills, not Kills).
 --    No previous holder = self-kill (no kill credit).
@@ -729,7 +658,7 @@ local function pruneKOs()
 end
 
 local pendingDeaths = {}
-local pendingBombs = {} -- [holder name] = credit of the bomb that killed them, for this batch
+local pendingBomb = nil
 local processScheduled = false
 
 local function resolveBombCredit(history)
@@ -764,24 +693,21 @@ local function processPendingDeaths()
 	if #pendingDeaths == 0 then return end
 	local batch = pendingDeaths
 	pendingDeaths = {}
-	local bombs = pendingBombs
-	pendingBombs = {}
+	local bomb = pendingBomb
+	pendingBomb = nil
 
 	-- There are no ties: right after the final explosion the game teleports/resets the survivor, which looks like a
-	-- second death. If this batch wipes out everyone still playing, only the bomb holders (and their teammates) died.
-	if next(bombs) then
+	-- second death. If this batch wipes out everyone still playing, only the bomb holder (and their teammates) died.
+	if bomb and bomb.holder then
 		local stillAlive = 0
 		for name in pairs(roundParticipants) do
 			if not deadPlayersThisRound[name] and Players:FindFirstChild(name) then stillAlive += 1 end
 		end
 		if stillAlive == 0 then
-			local holderTeams = {}
-			for holder in pairs(bombs) do
-				if PlayerTeams[holder] then holderTeams[PlayerTeams[holder]] = true end
-			end
+			local holderTeam = PlayerTeams[bomb.holder]
 			local kept = {}
 			for _, v in ipairs(batch) do
-				if bombs[v] or (PlayerTeams[v] and holderTeams[PlayerTeams[v]]) then
+				if v == bomb.holder or (holderTeam and PlayerTeams[v] == holderTeam) then
 					table.insert(kept, v)
 				else
 					deadPlayersThisRound[v] = nil
@@ -799,13 +725,12 @@ local function processPendingDeaths()
 	end
 
 	local credited = {}
-	local assistLogged = {} -- [bomb] = true: the stats count the assist once per explosion; log it on the first row only
+	local assistLogged = false -- the stats count the assist once per explosion; log it on the first row only
 	for _, victim in ipairs(batch) do
 		local killer
 		if koTracking then
 			killer = takeKO(deathClock[victim] or os.clock())
 		else
-			local bomb = bombs[victim] or select(2, next(bombs)) -- a holder's own bomb, else the blast they were caught in
 			killer = bomb and bomb.killer or nil
 		end
 		if killer == victim then killer = nil end
@@ -824,13 +749,8 @@ local function processPendingDeaths()
 		end
 		do -- same killer/assist rules as the stats above, so the timeline always matches the totals
 			local teamKill = killer ~= nil and PlayerTeams[killer] ~= nil and PlayerTeams[killer] == PlayerTeams[victim]
-			local assister = nil
-			for _, bomb in pairs(bombs) do
-				if killer and not assistLogged[bomb] and bomb.killer == killer and not bomb.teamKill and bomb.assisters[1] then
-					assister, assistLogged[bomb] = bomb.assisters[1], true
-					break
-				end
-			end
+			local assister = not assistLogged and bomb and killer and bomb.killer == killer and not bomb.teamKill and bomb.assisters[1] or nil
+			if assister then assistLogged = true end
 			timelineDeath(victim, killer, assister, teamKill)
 		end
 		print(string.format("[DEATH] %s(%s) killed by %s", victim, tostring(PlayerTeams[victim] or "?"), tostring(killer)))
@@ -854,12 +774,10 @@ local function processPendingDeaths()
 
 	-- assist: the player who passed the bomb to the credited killer (third last in the chain, a teammate of the killer).
 	-- Only when the killer is the one who passed it to the victim, and never for a team kill.
-	for _, bomb in pairs(bombs) do
-		if bomb.killer and not bomb.teamKill and credited[bomb.killer] then
-			for _, a in ipairs(bomb.assisters) do
-				ensureStats(a).Assists += 1
-				print("[ASSIST] " .. a .. " (passed it to " .. bomb.killer .. ")")
-			end
+	if bomb and bomb.killer and not bomb.teamKill and credited[bomb.killer] then
+		for _, a in ipairs(bomb.assisters) do
+			ensureStats(a).Assists += 1
+			print("[ASSIST] " .. a .. " (passed it to " .. bomb.killer .. ")")
 		end
 	end
 
@@ -875,13 +793,13 @@ local function handleDeath(victimName)
 	deathClock[victimName] = os.clock()
 	table.insert(pendingDeaths, victimName)
 
-	-- snapshot the victim's bomb chain at the exact moment of death
-	local chain = Bombs.chainOf(victimName)
-	if chain then
-		endHold(victimName, chain, os.clock())
-		pendingBombs[victimName] = resolveBombCredit(chain.names)
+	-- snapshot the bomb chain at the exact moment of death
+	if not pendingBomb and BombHistory[#BombHistory] == victimName then
+		endHold(victimName, os.clock())
+		heldSince, fuseStart = nil, nil
+		pendingBomb = resolveBombCredit(BombHistory)
 		LastBombHolderName = victimName
-		table.remove(Bombs.chains, table.find(Bombs.chains, chain))
+		BombHistory = {}
 	end
 
 	-- short window so every victim of the same explosion lands in one batch
@@ -894,7 +812,7 @@ local function handleDeath(victimName)
 	end
 end
 
-getHeldObject = function(character)
+local function getHeldObject(character)
 	if not character then return nil end
 	local player = Players:GetPlayerFromCharacter(character)
 
@@ -1011,8 +929,10 @@ local function setupPlayerTracker(player)
 				and string.find(string.lower(heldObject.Name), "bomb")
 				and RoundActive
 				and humanoid.Health > 0
-				and not deadPlayersThisRound[player.Name] then
+				and not deadPlayersThisRound[player.Name]
+				and BombHistory[#BombHistory] ~= player.Name then
 				noteHolder(player.Name)
+				print("[BOMB TRACKER] " .. player.Name .. " now holds the bomb (chain size " .. #BombHistory .. ")")
 			end
 		end
 
@@ -1068,10 +988,10 @@ local function beginRound()
 	deathClock = {}
 	roundParticipants = {}
 	pendingDeaths = {}
-	pendingBombs = {}
-	Bombs.chains = {}
+	pendingBomb = nil
+	BombHistory = {}
 	LastBombHolderName = nil
-	roundFirstOut = false
+	fuseStart, heldSince, roundFirstOut = nil, nil, false
 	snapshotParticipants()
 	timelineRoundStart()
 	print("[ROUND START]")
@@ -1083,7 +1003,10 @@ local function beginRound()
 		for _, p in ipairs(Players:GetPlayers()) do
 			if p.Character and roundParticipants[p.Name] then
 				local held = getHeldObject(p.Character)
-				if held and string.find(string.lower(held.Name), "bomb") then noteHolder(p.Name) end
+				if held and string.find(string.lower(held.Name), "bomb") and BombHistory[#BombHistory] ~= p.Name then
+					noteHolder(p.Name)
+					print("[BOMB TRACKER] Initial bomb holder: " .. p.Name)
+				end
 			end
 		end
 	end)
@@ -1100,7 +1023,7 @@ checkRoundState = function()
 				isRoundEnding = false
 				if getPlayingCount() > 0 then return end
 				RoundActive = false
-				Bombs.chains = {}
+				BombHistory = {}
 				print("[ROUND END]")
 			end)
 		end
@@ -1974,7 +1897,7 @@ do
 		setPhase("LIVE")
 		say(TEAM_A_NAME .. " 0 - 0 " .. TEAM_B_NAME .. " (first to " .. Rules.pointsToWin(SeriesPerSide) .. ", win by " .. Rules.WIN_BY .. ")")
 		Act.fire("ResetKOs") -- clear everyone's KOs (the captain rounds added some) before the first real round
-		Act.fire("StartMinigame", "Timebomb", Bombs.modeArgs(SeriesPerSide))
+		Act.fire("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
 	end
 
 	local function abortToLobby(reason)
@@ -2098,8 +2021,7 @@ do
 
 	-- one captain round; ties replay twice, then a random pick among the tied. Returns a userId or nil (aborted).
 	-- onlyIds limits the players for the captain duel (the random pick then only chooses between the two).
-	-- perSide: the match size, so the rounds use Multi exactly when the match will (the 1v1 duel passes nil: normal).
-	local function playCaptainRound(excludeId, onlyIds, perSide)
+	local function playCaptainRound(excludeId, onlyIds)
 		local eligible, pool = {}, lockedIds
 		if onlyIds then
 			pool = {}
@@ -2113,7 +2035,11 @@ do
 			if not captainPhaseActive() then return nil end
 			clearTheField()
 			if not captainPhaseActive() then return nil end
-			Act.fireFirst("StartMinigame", "Timebomb", Bombs.modeArgs(perSide or 0)) -- Multi exactly when the match will be
+			if #eligible > 14 then
+				Act.fireFirst("StartMinigame", "Timebomb", "Shrink", "Multi") -- big lobby: faster multi-bomb shrink round
+			else
+				Act.fireFirst("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
+			end
 			local kind, value = awaitCaptainResult()
 			endCaptainRound()
 			if not captainPhaseActive() then return nil end
@@ -2195,11 +2121,10 @@ do
 		setCaptain(TEAM_B_NAME, secondCaptain)
 		draftId, draftDone, draftApplied, draftPerSide = newMatchId(), false, {}, perSide
 		setPhase("DRAFT")
-		local pickSeconds = Rules.pickSeconds(cfg.pick_seconds, perSide)
-		say(string.format("Draft: captains pick in Discord (%ds)", pickSeconds))
+		say(string.format("Draft: captains pick in Discord (%ds)", cfg.pick_seconds))
 
 		local started = os.clock()
-		local limit = pickSeconds * perSide * 2 + 120 -- only reached if the bot stops answering
+		local limit = cfg.pick_seconds * perSide * 2 + 120 -- only reached if the bot stops answering
 		while Running and phase == "DRAFT" and not draftDone do
 			if not ensureCaptains() then
 				abortToLobby("A captain left and nobody is left to replace them. Back to the lobby.")
@@ -2252,7 +2177,7 @@ do
 					end
 				end)
 			end
-			local id = playCaptainRound(round == 2 and winners[1] or nil, nil, perSide)
+			local id = playCaptainRound(round == 2 and winners[1] or nil)
 			benching = false
 			if not id then
 				if phase == "CAPTAINS" then abortToLobby("Could not choose a captain. Back to the lobby.") end
@@ -2356,7 +2281,7 @@ do
 		practiceStartedAt, practiceSeen = now, false
 		say("PRACTICE ROUND")
 		-- the queue can be behind (kicks, timeouts): if the lobby has moved on by then, a late practice round must not start
-		Act.fireIf(function() return phase == "LOBBY" and practiceStartedAt ~= nil end, "StartMinigame", "Timebomb", Bombs.modeArgs(0))
+		Act.fireIf(function() return phase == "LOBBY" and practiceStartedAt ~= nil end, "StartMinigame", "Timebomb", "LeagueStandard", "Normal")
 	end
 
 	local function lobbyTick()
@@ -2399,7 +2324,7 @@ do
 			startRetries += 1
 			liveSince = os.clock()
 			warn("[SCRIM] no round started, firing StartMinigame again")
-			Act.fire("StartMinigame", "Timebomb", Bombs.modeArgs(SeriesPerSide))
+			Act.fire("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
 		end
 
 		-- a team with nobody in the server (disconnected players may still rejoin) forfeits after FORFEIT_SECONDS
