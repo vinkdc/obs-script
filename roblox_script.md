@@ -48,8 +48,6 @@ local UNKICK_DELAY_SECONDS = 30                  -- after the match ends and eve
 local MAX_QUEUE = 60                             -- pending remotes cap: a runaway loop can't grow the queue (and the sort per push) forever
 local MAX_BOMB_HISTORY = 20                      -- bomb-holder chain cap
 local FUSE_SECONDS = 10                          -- the bomb always explodes 10s after the fuse resets (every explosion)
-local MULTI_FROM_PER_SIDE = 7                    -- 7v7 and up play "Shrink" + "Multi" (several bombs at once) to keep big lobbies short
-local ACE_KILLS = 5                              -- an ace = this many enemy kills in one round (5v5 and up)
 local HOT_PASS_WINDOW = 2                        -- receiving the bomb with this many seconds or less left on the fuse and passing it to an enemy is a hot pass (late track)
 local MAX_PENDING_FINALS = 10                    -- unacked match results kept while the bot is unreachable
 local MAX_KICKS_PER_MINUTE = 25                 -- safety valve: a bug can never mass-kick the server
@@ -74,7 +72,10 @@ local function buildTimeoutArgs(userId, on)
 end
 
 --// Rules (mirror of core/services/scrim_rules.py; vectors are self-checked below)
-local Rules = { WIN_BY = 2, CAP_OVER = 3, MAX_PER_TEAM = 8 } -- hard cap = points to win + CAP_OVER
+-- hard cap = points to win + CAP_OVER. MULTI_FROM: 7v7 and up play "Shrink" + "Multi" (several bombs at once) to keep big
+-- lobbies short. ACE_KILLS: an ace = this many enemy kills in one round (5v5 and up).
+-- (The main chunk is near Luau's local-variable limit: add new settings as fields, not new top-level locals.)
+local Rules = { WIN_BY = 2, CAP_OVER = 3, MAX_PER_TEAM = 8, MULTI_FROM = 7, ACE_KILLS = 5 }
 
 function Rules.pointsToWin(perSide)
 	return perSide >= 4 and 11 or 7
@@ -157,8 +158,8 @@ local deathClock = {}              -- { ["PlayerName"] = os.clock() } of this ro
 local roundParticipants = {}    -- { ["PlayerName"] = true } snapshot at round start
 -- one chain per live bomb (Multi has several): { names = holders in order since its last explosion,
 -- fuseStart = os.clock() when its first holder got it, heldSince = os.clock() when its current holder got it }
-local BombChains = {}
-local MultiBombs = false        -- the current bomb round is "Multi"
+-- multi = the current bomb round is "Multi"
+local Bombs = { chains = {}, multi = false }
 local LastBombHolderName = nil
 local roundFirstOut = false     -- true once someone has died this round
 local Running = true
@@ -249,9 +250,9 @@ local function ensureStats(name)
 end
 
 -- the StartMinigame mode args for a match of perSide players a side (also tells the bomb tracker how many bombs to expect)
-local function bombModeArgs(perSide)
-	MultiBombs = perSide >= MULTI_FROM_PER_SIDE
-	if MultiBombs then return "Shrink", "Multi" end
+function Bombs.modeArgs(perSide)
+	Bombs.multi = perSide >= Rules.MULTI_FROM
+	if Bombs.multi then return "Shrink", "Multi" end
 	return "LeagueStandard", "Normal"
 end
 
@@ -266,20 +267,20 @@ end
 local getHeldObject -- defined with the nametags below
 
 -- the chain of the bomb this player holds (or held last, while it is passed on)
-local function chainOf(name)
-	for _, c in ipairs(BombChains) do
+function Bombs.chainOf(name)
+	for _, c in ipairs(Bombs.chains) do
 		if c.names[#c.names] == name then return c end
 	end
 	return nil
 end
 
-local function holdsBomb(name)
+function Bombs.holds(name)
 	local p = Players:FindFirstChild(name)
 	local held = p and p.Character and getHeldObject(p.Character)
 	return held ~= nil and string.find(string.lower(held.Name), "bomb") ~= nil
 end
 
-local function rootPos(name)
+function Bombs.rootPos(name)
 	local p = Players:FindFirstChild(name)
 	local root = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
 	return root and root.Position
@@ -287,15 +288,15 @@ end
 
 -- Multi: a pass is a touch, so the bomb came from the nearest previous holder who no longer has one.
 -- Chains past their fuse have exploded (or vanished) and are dropped. nil = a fresh bomb.
-local function adoptChain(name, now)
-	local here, best, bestDist = rootPos(name), nil, math.huge
-	for i = #BombChains, 1, -1 do
-		local c = BombChains[i]
+function Bombs.adopt(name, now)
+	local here, best, bestDist = Bombs.rootPos(name), nil, math.huge
+	for i = #Bombs.chains, 1, -1 do
+		local c = Bombs.chains[i]
 		local last = c.names[#c.names]
 		if now - c.fuseStart > FUSE_SECONDS + 1 then
-			table.remove(BombChains, i)
-		elseif last ~= name and not holdsBomb(last) then
-			local there = rootPos(last)
+			table.remove(Bombs.chains, i)
+		elseif last ~= name and not Bombs.holds(last) then
+			local there = Bombs.rootPos(last)
 			local d = (here and there) and (here - there).Magnitude or 1e6
 			if d < bestDist then best, bestDist = c, d end
 		end
@@ -305,20 +306,20 @@ end
 
 -- a new bomb holder: closes the last holder's hold and counts a hot pass if they got it late and passed it to an enemy
 local function noteHolder(name, at, retried)
-	if chainOf(name) then return end
+	if Bombs.chainOf(name) then return end
 	local now = at or os.clock()
 	local c
-	if MultiBombs then
-		c = adoptChain(name, now)
-		if not c and not retried and #BombChains > 0 then
+	if Bombs.multi then
+		c = Bombs.adopt(name, now)
+		if not c and not retried and #Bombs.chains > 0 then
 			-- the passer's bomb may not be gone yet on our side: look again in a moment before calling it a new bomb
 			task.delay(0.25, function()
-				if RoundActive and not deadPlayersThisRound[name] and holdsBomb(name) then noteHolder(name, now, true) end
+				if RoundActive and not deadPlayersThisRound[name] and Bombs.holds(name) then noteHolder(name, now, true) end
 			end)
 			return
 		end
 	else
-		c = BombChains[1] -- one bomb: every new holder got it from the last one
+		c = Bombs.chains[1] -- one bomb: every new holder got it from the last one
 	end
 	if c then
 		local prev = c.names[#c.names]
@@ -329,12 +330,12 @@ local function noteHolder(name, at, retried)
 		end
 	else
 		c = { names = {}, fuseStart = now } -- first holder since an explosion: the fuse just reset
-		table.insert(BombChains, c)
+		table.insert(Bombs.chains, c)
 	end
 	c.heldSince = now
 	table.insert(c.names, name)
 	if #c.names > MAX_BOMB_HISTORY then table.remove(c.names, 1) end
-	print("[BOMB TRACKER] " .. name .. " now holds a bomb (chain size " .. #c.names .. ", bombs " .. #BombChains .. ")")
+	print("[BOMB TRACKER] " .. name .. " now holds a bomb (chain size " .. #c.names .. ", bombs " .. #Bombs.chains .. ")")
 end
 
 local function printStats()
@@ -553,7 +554,7 @@ local function startNextRound()
 	if not SeriesActive then return end -- the match ended (forfeit, /scrim stop) while we waited: no new round
 	if Agent.beforeRound then Agent.beforeRound() end -- bench latecomers before the next bomb round
 	if not SeriesActive then return end -- clearing the field can take up to 30s
-	Act.fire("StartMinigame", "Timebomb", bombModeArgs(SeriesPerSide))
+	Act.fire("StartMinigame", "Timebomb", Bombs.modeArgs(SeriesPerSide))
 	print("[GAMELOOP] Next round started")
 
 	-- If the server never emptied the Playing team, force a fresh round state
@@ -612,7 +613,7 @@ local function checkRoundWinner()
 			if not deadPlayersThisRound[name] and Players:FindFirstChild(name) then s.RoundsSurvived += 1 end
 		end
 	end
-	-- moments the bot announces in Discord. Ace: one player killed ACE_KILLS (5) enemies in the round, from 5v5 up.
+	-- moments the bot announces in Discord. Ace: one player killed 5 enemies in the round, from 5v5 up.
 	-- Clutch: the last player alive beat 3 or more enemies. Flawless: the team won without losing a player (both from 3v3 up).
 	local participants = {}
 	for name in pairs(roundParticipants) do
@@ -623,7 +624,7 @@ local function checkRoundWinner()
 	if SeriesPerSide >= 5 then
 		for killer, n in pairs(roundKills) do
 			local team = PlayerTeams[killer]
-			if team == roundWinner and n >= ACE_KILLS then
+			if team == roundWinner and n >= Rules.ACE_KILLS then
 				aced[killer] = true
 				ensureStats(killer).Aces += 1
 				if Agent.onMoment then Agent.onMoment("ace", killer, team) end
@@ -636,7 +637,7 @@ local function checkRoundWinner()
 			ensureStats(seed.name).Clutches += 1
 			-- 1 vs 5 or more is an ace too: after an explosion the bomb respawns on a random player and
 			-- enemies sac each other, so those deaths never credit the survivor's roundKills even though they outlasted them all
-			if SeriesPerSide >= 5 and seed.enemies >= ACE_KILLS then
+			if SeriesPerSide >= 5 and seed.enemies >= Rules.ACE_KILLS then
 				if not aced[seed.name] then
 					ensureStats(seed.name).Aces += 1
 					Agent.onMoment("ace", seed.name, roundWinner)
@@ -678,7 +679,7 @@ end
 --// DEATH + KILL CREDIT
 --// =========================================================
 -- How credit works:
---  * Each live bomb has a chain (BombChains): the ordered list of players who held it since its last explosion.
+--  * Each live bomb has a chain (Bombs.chains): the ordered list of players who held it since its last explosion.
 --  * The moment a bomb's CURRENT holder dies, we snapshot that chain and drop it,
 --    so a new bomb / dead-player tool events can't pollute it.
 --  * Killer = the player who passed the bomb last. If the victim is their teammate it is a team kill (TeamKills, not Kills).
@@ -875,12 +876,12 @@ local function handleDeath(victimName)
 	table.insert(pendingDeaths, victimName)
 
 	-- snapshot the victim's bomb chain at the exact moment of death
-	local chain = chainOf(victimName)
+	local chain = Bombs.chainOf(victimName)
 	if chain then
 		endHold(victimName, chain, os.clock())
 		pendingBombs[victimName] = resolveBombCredit(chain.names)
 		LastBombHolderName = victimName
-		table.remove(BombChains, table.find(BombChains, chain))
+		table.remove(Bombs.chains, table.find(Bombs.chains, chain))
 	end
 
 	-- short window so every victim of the same explosion lands in one batch
@@ -1068,7 +1069,7 @@ local function beginRound()
 	roundParticipants = {}
 	pendingDeaths = {}
 	pendingBombs = {}
-	BombChains = {}
+	Bombs.chains = {}
 	LastBombHolderName = nil
 	roundFirstOut = false
 	snapshotParticipants()
@@ -1099,7 +1100,7 @@ checkRoundState = function()
 				isRoundEnding = false
 				if getPlayingCount() > 0 then return end
 				RoundActive = false
-				BombChains = {}
+				Bombs.chains = {}
 				print("[ROUND END]")
 			end)
 		end
@@ -1973,7 +1974,7 @@ do
 		setPhase("LIVE")
 		say(TEAM_A_NAME .. " 0 - 0 " .. TEAM_B_NAME .. " (first to " .. Rules.pointsToWin(SeriesPerSide) .. ", win by " .. Rules.WIN_BY .. ")")
 		Act.fire("ResetKOs") -- clear everyone's KOs (the captain rounds added some) before the first real round
-		Act.fire("StartMinigame", "Timebomb", bombModeArgs(SeriesPerSide))
+		Act.fire("StartMinigame", "Timebomb", Bombs.modeArgs(SeriesPerSide))
 	end
 
 	local function abortToLobby(reason)
@@ -2112,7 +2113,7 @@ do
 			if not captainPhaseActive() then return nil end
 			clearTheField()
 			if not captainPhaseActive() then return nil end
-			Act.fireFirst("StartMinigame", "Timebomb", bombModeArgs(perSide or 0)) -- Multi exactly when the match will be
+			Act.fireFirst("StartMinigame", "Timebomb", Bombs.modeArgs(perSide or 0)) -- Multi exactly when the match will be
 			local kind, value = awaitCaptainResult()
 			endCaptainRound()
 			if not captainPhaseActive() then return nil end
@@ -2355,7 +2356,7 @@ do
 		practiceStartedAt, practiceSeen = now, false
 		say("PRACTICE ROUND")
 		-- the queue can be behind (kicks, timeouts): if the lobby has moved on by then, a late practice round must not start
-		Act.fireIf(function() return phase == "LOBBY" and practiceStartedAt ~= nil end, "StartMinigame", "Timebomb", bombModeArgs(0))
+		Act.fireIf(function() return phase == "LOBBY" and practiceStartedAt ~= nil end, "StartMinigame", "Timebomb", Bombs.modeArgs(0))
 	end
 
 	local function lobbyTick()
@@ -2398,7 +2399,7 @@ do
 			startRetries += 1
 			liveSince = os.clock()
 			warn("[SCRIM] no round started, firing StartMinigame again")
-			Act.fire("StartMinigame", "Timebomb", bombModeArgs(SeriesPerSide))
+			Act.fire("StartMinigame", "Timebomb", Bombs.modeArgs(SeriesPerSide))
 		end
 
 		-- a team with nobody in the server (disconnected players may still rejoin) forfeits after FORFEIT_SECONDS
