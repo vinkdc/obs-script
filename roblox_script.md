@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.5.0" -- bump on every edit
+local SCRIPT_VERSION = "1.6.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -1268,6 +1268,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local pausedAt = 0       -- os.clock() when the admin paused; the frozen time is added to the timers on resume
 	local forceStart = false -- /scrim console Force start: lock now with as few as 2 verified players
 	local bigStart = false   -- /scrim console Big match: like Force start, random teams up to MAX_BIG_PER_TEAM a side, unrated
+	local customTeams = {}   -- [userId] = team: set from the console in the lobby; holds the automatic start until Custom match or Clear teams
 	local matchUnrated = false -- the current match is a big match: the bot logs it without touching ratings
 	local announced = {}
 	local timerResetBy = {} -- [userId] = true: in the lobby when this countdown began, or already reset its timer once
@@ -1369,6 +1370,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		for _, p in ipairs(Players:GetPlayers()) do updatePlayerNametag(p) end
 		countdownEnds, breakEnds, matchId = nil, nil, nil
 		latched, locking, lobbyFloor, forceStart, bigStart, matchUnrated = false, false, 0, false, false, false
+		customTeams = {}
 		kickPending, kickAttempts, warnedAt = {}, {}, {}
 		lockedIds, leftIds, nameById, captains, captainRound = {}, {}, {}, {}, 0
 		leftAt, voteKicked = {}, {}
@@ -1506,7 +1508,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		for _, p in ipairs(presentPlayers()) do
 			if not kickPending[p.UserId] then
 				local info = matchRoster[p.UserId]
-				table.insert(players, { id = p.UserId, name = p.Name, display = p.DisplayName, team = info and info.team or nil })
+				table.insert(players, { id = p.UserId, name = p.Name, display = p.DisplayName, team = info and info.team or customTeams[p.UserId] })
 				table.insert(ids, p.UserId)
 			end
 		end
@@ -1920,8 +1922,21 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		local p = type(name) == "number" and Players:GetPlayerByUserId(name) or Players:FindFirstChild(tostring(name))
 		if not p or not p:IsA("Player") then return warn("[SCRIM] assign: no player named " .. tostring(name)) end
 		if team ~= TEAM_A_NAME and team ~= TEAM_B_NAME then return warn("[SCRIM] assign: team must be \"" .. TEAM_A_NAME .. "\" or \"" .. TEAM_B_NAME .. "\"") end
-		if phase ~= "LIVE" and phase ~= "DRAFT" then return warn("[SCRIM] assign: only during the draft or a live match") end
 		local id = p.UserId
+		if phase == "LOBBY" or phase == "COUNTDOWN" then
+			-- a custom match is being set up: remember the team and stop the automatic start
+			if locking then return end
+			if verifiedCache[id] ~= true then return warn("[SCRIM] assign: " .. p.Name .. " is not verified") end
+			customTeams[id] = team
+			if phase == "COUNTDOWN" then
+				countdownEnds, latched = nil, false
+				setPhase("LOBBY")
+			end
+			say(string.format("%s set to %s (custom match)", p.Name, team))
+			syncNow = true
+			return
+		end
+		if phase ~= "LIVE" and phase ~= "DRAFT" then return warn("[SCRIM] assign: only before the match, during the draft or in a live match") end
 		for _, t in ipairs({ TEAM_A_NAME, TEAM_B_NAME }) do
 			for i = #teamOrder[t], 1, -1 do
 				if teamOrder[t][i] == id then table.remove(teamOrder[t], i) end
@@ -1968,11 +1983,9 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		absentSince, absentWarned = {}, {}
 		locking = false
 		koEvents = {}
-		local perSide = 0
-		for _, info in pairs(matchRoster) do
-			if info.team == TEAM_A_NAME then perSide += 1 end
-		end
-		SeriesPerSide = math.max(perSide, 1)
+		local sizes = { [TEAM_A_NAME] = 0, [TEAM_B_NAME] = 0 }
+		for _, info in pairs(matchRoster) do sizes[info.team] += 1 end
+		SeriesPerSide = math.max(sizes[TEAM_A_NAME], sizes[TEAM_B_NAME], 1) -- uneven custom teams play to the bigger side's target
 		setPhase("LIVE")
 		say(TEAM_A_NAME .. " 0 - 0 " .. TEAM_B_NAME .. " | first to " .. Rules.pointsToWin(SeriesPerSide))
 		Act.fire("ResetKOs") -- clear everyone's KOs (the captain rounds added some) before the first real round
@@ -1991,7 +2004,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		teamOrder = { [TEAM_A_NAME] = {}, [TEAM_B_NAME] = {} }
 		draftId, draftDone, draftApplied = nil, false, {}
 		countdownEnds, latched, locking, lobbyFloor, forceStart, bigStart, matchUnrated = nil, false, false, 0, false, false, false
-		Paused = false
+		Paused, customTeams = false, {}
 		setPhase("LOBBY")
 	end
 
@@ -2371,7 +2384,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	end
 
 	local function lobbyTick()
-		if locking or Paused then return end
+		if locking or Paused or next(customTeams) ~= nil then return end
 		local n = #lobbyRoster()
 		if phase == "LOBBY" then
 			if n < lobbyFloor then lobbyFloor = n end
@@ -2454,6 +2467,59 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		end
 	end
 
+	-- /scrim console Custom match: lock with exactly the teams set in the lobby (any sizes, uneven allowed), unrated.
+	-- Verified players without a team sit out; unverified ones are kicked, as at a normal lock.
+	local function startCustom()
+		if locking then return end
+		locking = true
+		Agent.forceSync() -- fresh verification before locking
+		if phase ~= "LOBBY" and phase ~= "COUNTDOWN" then
+			locking = false
+			return
+		end
+		local present, counts = lobbyRoster(), { [TEAM_A_NAME] = 0, [TEAM_B_NAME] = 0 }
+		for _, p in ipairs(present) do
+			local team = customTeams[p.UserId]
+			if team then counts[team] += 1 end
+		end
+		if counts[TEAM_A_NAME] == 0 or counts[TEAM_B_NAME] == 0 then
+			say("Custom match needs a player on each team")
+			locking = false
+			return
+		end
+		countdownEnds, latched, lobbyFloor = nil, false, 0
+		lockedIds, leftIds, nameById, captains = {}, {}, {}, {}
+		leftAt, voteKicked = {}, {}
+		matchRoster, PlayerTeams = {}, {}
+		local names = { [TEAM_A_NAME] = {}, [TEAM_B_NAME] = {} }
+		local notPicked = {}
+		for _, p in ipairs(present) do
+			local id, team = p.UserId, customTeams[p.UserId]
+			lockedIds[id], nameById[id] = true, p.Name
+			if team then
+				matchRoster[id] = { name = p.Name, team = team }
+				PlayerTeams[p.Name] = team
+				table.insert(names[team], p.Name)
+				updatePlayerNametag(p)
+			else
+				timedOut[id] = true -- verified but not on a team: sits out, released after the match
+				Act.timeout(id, true)
+				table.insert(notPicked, p.Name)
+			end
+		end
+		for _, p in ipairs(presentPlayers()) do
+			if not lockedIds[p.UserId] then kick(p, true) end
+		end
+		customTeams = {}
+		matchUnrated = true
+		say(string.format("Custom match (unrated): %dv%d", counts[TEAM_A_NAME], counts[TEAM_B_NAME]))
+		say(TEAM_A_NAME .. ": " .. table.concat(names[TEAM_A_NAME], ", "))
+		say(TEAM_B_NAME .. ": " .. table.concat(names[TEAM_B_NAME], ", "))
+		if #notPicked > 0 then say("Sitting out: " .. table.concat(notPicked, ", ")) end
+		Act.drain()
+		beginLive()
+	end
+
 	-- from Discord: /scrim console. Each command arrives once (by key); the phase is checked again here because it may have moved on.
 	-- Every remote it fires goes through the jittered action queue like everything else.
 	function Agent.admin(cmd)
@@ -2466,9 +2532,17 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			local n = #lobbyRoster()
 			if n < 2 then return say("Force start needs 2 verified players") end
 			forceStart, bigStart = true, action == "big_start"
-			Paused = false -- starting now overrides a pause
+			Paused, customTeams = false, {} -- starting now overrides a pause and any custom teams
 			if phase == "LOBBY" then startCountdown(n) end
 			countdownEnds = os.clock() -- lobbyTick locks on its next tick
+		elseif action == "custom_start" then
+			if (phase ~= "LOBBY" and phase ~= "COUNTDOWN") or locking then return end
+			Paused = false
+			task.spawn(startCustom) -- it waits for a sync and the action queue, so not on the sync loop
+		elseif action == "clear_teams" then
+			if next(customTeams) == nil then return end
+			customTeams = {}
+			say("Custom teams cleared")
 		elseif action == "skip_break" then
 			if phase == "BREAK" then breakEnds, Paused = os.clock(), false end
 		elseif action == "pause" then
