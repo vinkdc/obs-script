@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.3.0" -- bump on every edit
+local SCRIPT_VERSION = "1.5.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -73,7 +73,7 @@ local function buildTimeoutArgs(userId, on)
 end
 
 --// Rules (mirror of core/services/scrim_rules.py; vectors are self-checked below)
-local Rules = { WIN_BY = 2, CAP_OVER = 3, MAX_PER_TEAM = 5 } -- hard cap = points to win + CAP_OVER
+local Rules = { WIN_BY = 2, CAP_OVER = 3, MAX_PER_TEAM = 5, MAX_BIG_PER_TEAM = 10 } -- hard cap = points to win + CAP_OVER
 
 function Rules.pointsToWin(perSide)
 	return perSide >= 4 and 11 or 7
@@ -138,6 +138,7 @@ local STOP_ROUND_ARGS = { "StopMinigame" }
 
 local SeriesScore = { [TEAM_A_NAME] = 0, [TEAM_B_NAME] = 0 }
 local SeriesActive = false
+local Paused = false -- /scrim console Pause: no new round starts and the lobby, countdown and break timers stand still
 local SeriesPerSide = 2 -- players per team in the live match (decides first to 7 or 11); set when the match goes live
 local PlayerTeams = {}          -- { ["PlayerName"] = "Black" }
 
@@ -486,7 +487,9 @@ local function stopRound()
 	end
 end
 
-local function startNextRound()
+local NextRoundPending = false -- a startNextRound is running (it may be waiting out a pause)
+
+local function nextRound()
 	-- one team is wiped, so end the current round before starting the next
 	stopRound()
 	local timeout = 10
@@ -496,6 +499,8 @@ local function startNextRound()
 	end
 	task.wait(2)
 	if not SeriesActive then return end -- the match ended (forfeit, /scrim stop) while we waited: no new round
+	while Paused and SeriesActive do task.wait(0.5) end -- paused by an admin: hold the next round until they resume
+	if not SeriesActive then return end
 	if Agent.beforeRound then Agent.beforeRound() end -- bench latecomers before the next bomb round
 	if not SeriesActive then return end -- clearing the field can take up to 30s
 	Act.fire("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
@@ -507,6 +512,13 @@ local function startNextRound()
 		RoundActive = false
 		checkRoundState()
 	end
+end
+
+local function startNextRound()
+	NextRoundPending = true
+	local ok, err = pcall(nextRound)
+	NextRoundPending = false
+	if not ok then warn("[GAMELOOP] next round failed: " .. tostring(err)) end
 end
 
 local function checkRoundWinner()
@@ -1253,7 +1265,10 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local countdownEnds, breakEnds = nil, nil
 	local latched, locking = false, false
 	local lobbyFloor = 0 -- after a failed lock, wait until MORE verified players are in before re-arming
+	local pausedAt = 0       -- os.clock() when the admin paused; the frozen time is added to the timers on resume
 	local forceStart = false -- /scrim console Force start: lock now with as few as 2 verified players
+	local bigStart = false   -- /scrim console Big match: like Force start, random teams up to MAX_BIG_PER_TEAM a side, unrated
+	local matchUnrated = false -- the current match is a big match: the bot logs it without touching ratings
 	local announced = {}
 	local timerResetBy = {} -- [userId] = true: in the lobby when this countdown began, or already reset its timer once
 	local matchId = nil
@@ -1349,11 +1364,11 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		Act.clear()
 		setAnonymous(false) -- never leave anonymous mode on
 		releaseAllTimeouts() -- timeouts persist in the game, so never leave anyone stuck
-		SeriesActive = false
+		SeriesActive, Paused = false, false
 		matchRoster, PlayerTeams, MatchStats = {}, {}, {}
 		for _, p in ipairs(Players:GetPlayers()) do updatePlayerNametag(p) end
 		countdownEnds, breakEnds, matchId = nil, nil, nil
-		latched, locking, lobbyFloor, forceStart = false, false, 0, false
+		latched, locking, lobbyFloor, forceStart, bigStart, matchUnrated = false, false, 0, false, false, false
 		kickPending, kickAttempts, warnedAt = {}, {}, {}
 		lockedIds, leftIds, nameById, captains, captainRound = {}, {}, {}, {}, 0
 		leftAt, voteKicked = {}, {}
@@ -1541,11 +1556,14 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		local phaseEnds = nil
 		if phase == "COUNTDOWN" and countdownEnds then phaseEnds = os.time() + secondsLeft(countdownEnds) end
 		if phase == "BREAK" and breakEnds then phaseEnds = os.time() + secondsLeft(breakEnds) end
+		if Paused then phaseEnds = nil end -- the timer is frozen
 		return {
 			session_id = sessionId,
 			phase = phase,
 			phase_ends = phaseEnds,
 			match_id = matchId,
+			unrated = matchUnrated,
+			paused = Paused,
 			score = { [TEAM_A_NAME] = SeriesScore[TEAM_A_NAME], [TEAM_B_NAME] = SeriesScore[TEAM_B_NAME] },
 			players = players,
 			stats = stats,
@@ -1643,6 +1661,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local function resumeMatch(r)
 		resetAll()
 		matchId = r.match_id
+		matchUnrated = r.unrated == true
 		SeriesScore = { [TEAM_A_NAME] = (r.score or {})[TEAM_A_NAME] or 0, [TEAM_B_NAME] = (r.score or {})[TEAM_B_NAME] or 0 }
 		MatchStats = {}
 		local perSide = 0
@@ -1831,6 +1850,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			score = { [TEAM_A_NAME] = a, [TEAM_B_NAME] = b },
 			winner = winnerTeam,
 			forfeit = forfeit,
+			unrated = matchUnrated,
 			rounds = a + b,
 			stats = {},
 			timeline = timelineExport(),
@@ -1843,6 +1863,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		end
 		table.insert(pendingFinals, final)
 		while #pendingFinals > MAX_PENDING_FINALS do table.remove(pendingFinals, 1) end
+		Paused = false
 		setPhase("POSTGAME")
 
 		task.spawn(function()
@@ -1854,14 +1875,14 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			if phase ~= "POSTGAME" then return end -- /scrim stop happened meanwhile
 			matchRoster, PlayerTeams = {}, {}
 			for _, p in ipairs(Players:GetPlayers()) do updatePlayerNametag(p) end
-			matchId = nil
+			matchId, matchUnrated = nil, false
 			kickAttempts = {}
 			lockedIds, leftIds, nameById, captains = {}, {}, {}, {}
 			leftAt, voteKicked = {}, {}
 			breakEnds = os.clock() + cfg.break_seconds
 			setPhase("BREAK")
 			task.spawn(unkickAll)
-			while Running and phase == "BREAK" and os.clock() < breakEnds do task.wait(1) end
+			while Running and phase == "BREAK" and (Paused or os.clock() < breakEnds) do task.wait(1) end
 			if Running and phase == "BREAK" then
 				countdownEnds, latched = nil, false
 				setPhase("LOBBY")
@@ -1969,7 +1990,8 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		leftAt, voteKicked = {}, {}
 		teamOrder = { [TEAM_A_NAME] = {}, [TEAM_B_NAME] = {} }
 		draftId, draftDone, draftApplied = nil, false, {}
-		countdownEnds, latched, locking, lobbyFloor, forceStart = nil, false, false, 0, false
+		countdownEnds, latched, locking, lobbyFloor, forceStart, bigStart, matchUnrated = nil, false, false, 0, false, false, false
+		Paused = false
 		setPhase("LOBBY")
 	end
 
@@ -2285,8 +2307,9 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			return
 		end
 		local roster = lobbyRoster()
-		local perSide = Rules.teamSize(#roster, forceStart and 2 or cfg.min_players)
-		forceStart = false
+		local big = bigStart
+		local perSide = big and math.min(#roster // 2, Rules.MAX_BIG_PER_TEAM) or Rules.teamSize(#roster, forceStart and 2 or cfg.min_players)
+		forceStart, bigStart = false, false
 		if perSide == 0 then
 			say(string.format("Waiting for players (%d/%d)", #roster, cfg.min_players))
 			countdownEnds, latched, lobbyFloor = nil, false, #roster
@@ -2307,7 +2330,11 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			if not lockedIds[p.UserId] then kick(p, true) end
 		end
 
-		if cfg.captains == 1 and perSide > 1 then
+		matchUnrated = big
+		if big then
+			say(string.format("Unrated big match: %dv%d", perSide, perSide))
+			runRandomTeams(roster, perSide) -- no captain draft: the bot's draft is built for 5 a side at most
+		elseif cfg.captains == 1 and perSide > 1 then
 			runCaptains(perSide)
 		else
 			runRandomTeams(roster, perSide) -- captains disabled, or only one player per side (nothing to draft)
@@ -2319,7 +2346,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local practiceStartedAt, practiceSeen, practiceNextAt = nil, false, 0
 
 	local function practiceTick()
-		if phase ~= "LOBBY" or locking then
+		if phase ~= "LOBBY" or locking or Paused then
 			practiceStartedAt = nil
 			return
 		end
@@ -2344,7 +2371,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	end
 
 	local function lobbyTick()
-		if locking then return end
+		if locking or Paused then return end
 		local n = #lobbyRoster()
 		if phase == "LOBBY" then
 			if n < lobbyFloor then lobbyFloor = n end
@@ -2378,6 +2405,11 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 
 	local function liveTick()
 		if phase ~= "LIVE" or not SeriesActive then return end
+		if Paused then -- no forfeit countdown and no round-start retry while paused
+			absentSince, absentWarned = {}, {}
+			liveSince = os.clock()
+			return
+		end
 		if RoundActive then roundSeen = true end
 		if not roundSeen and startRetries < 2 and os.clock() - liveSince > 45 then
 			startRetries += 1
@@ -2429,15 +2461,43 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		local p = type(cmd.id) == "number" and Players:GetPlayerByUserId(cmd.id) or nil
 		local function currentScore() return { [TEAM_A_NAME] = SeriesScore[TEAM_A_NAME], [TEAM_B_NAME] = SeriesScore[TEAM_B_NAME] } end
 		print("[SCRIM] admin: " .. tostring(action) .. (p and (" " .. p.Name) or ""))
-		if action == "force_start" then
+		if action == "force_start" or action == "big_start" then
 			if (phase ~= "LOBBY" and phase ~= "COUNTDOWN") or locking then return end
 			local n = #lobbyRoster()
 			if n < 2 then return say("Force start needs 2 verified players") end
-			forceStart = true
+			forceStart, bigStart = true, action == "big_start"
+			Paused = false -- starting now overrides a pause
 			if phase == "LOBBY" then startCountdown(n) end
 			countdownEnds = os.clock() -- lobbyTick locks on its next tick
 		elseif action == "skip_break" then
-			if phase == "BREAK" then breakEnds = os.clock() end
+			if phase == "BREAK" then breakEnds, Paused = os.clock(), false end
+		elseif action == "pause" then
+			if Paused or (phase ~= "LOBBY" and phase ~= "COUNTDOWN" and phase ~= "BREAK" and phase ~= "LIVE") or locking then return end
+			Paused, pausedAt = true, os.clock()
+			if phase == "LIVE" then
+				stopRound() -- the round in progress is dropped (no point to anyone); the next one waits for resume
+				say("Match paused by admin")
+			else
+				say("Paused by admin")
+			end
+		elseif action == "resume" then
+			if not Paused then return end
+			Paused = false
+			local frozen = os.clock() - pausedAt -- timers pick up where they stopped
+			if countdownEnds then countdownEnds += frozen end
+			if breakEnds then breakEnds += frozen end
+			say(phase == "LIVE" and "Match resumed" or "Resumed")
+			if phase == "LIVE" and SeriesActive and not NextRoundPending then task.spawn(startNextRound) end
+		elseif action == "add_time" then
+			if phase == "COUNTDOWN" and countdownEnds then
+				countdownEnds += 30
+				announced = {}
+			elseif phase == "BREAK" and breakEnds then
+				breakEnds += 30
+			else
+				return
+			end
+			say("+30s added by admin")
 		elseif action == "restart_round" then
 			if phase ~= "LIVE" or not SeriesActive then return end
 			say("Round restarted by admin")
