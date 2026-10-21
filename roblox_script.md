@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.2.1" -- bump on every edit
+local SCRIPT_VERSION = "1.3.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -1253,6 +1253,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local countdownEnds, breakEnds = nil, nil
 	local latched, locking = false, false
 	local lobbyFloor = 0 -- after a failed lock, wait until MORE verified players are in before re-arming
+	local forceStart = false -- /scrim console Force start: lock now with as few as 2 verified players
 	local announced = {}
 	local timerResetBy = {} -- [userId] = true: in the lobby when this countdown began, or already reset its timer once
 	local matchId = nil
@@ -1268,6 +1269,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local leftIds = {}       -- [userId] = true: left after the lock and the rejoin grace ran out; cannot come back this match
 	local anonymousOn = false -- anonymous mode is on during the captain rounds only
 	local assignedAck = {}   -- [userId] = true: applied a Discord /scrim assign; sent until the bot stops resending it
+	local adminAck = {}      -- [key] = true: ran a /scrim console command; sent until the bot stops resending it
 	local function setAnonymous(on)
 		if on == anonymousOn then return end
 		anonymousOn = on
@@ -1351,7 +1353,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		matchRoster, PlayerTeams, MatchStats = {}, {}, {}
 		for _, p in ipairs(Players:GetPlayers()) do updatePlayerNametag(p) end
 		countdownEnds, breakEnds, matchId = nil, nil, nil
-		latched, locking, lobbyFloor = false, false, 0
+		latched, locking, lobbyFloor, forceStart = false, false, 0, false
 		kickPending, kickAttempts, warnedAt = {}, {}, {}
 		lockedIds, leftIds, nameById, captains, captainRound = {}, {}, {}, {}, 0
 		leftAt, voteKicked = {}, {}
@@ -1514,6 +1516,8 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		end
 		local assignedList = {}
 		for id in pairs(assignedAck) do table.insert(assignedList, id) end
+		local adminList = {}
+		for key in pairs(adminAck) do table.insert(adminList, key) end
 		local votekickedList = {}
 		for id in pairs(voteKicked) do table.insert(votekickedList, id) end
 		local kickedList = {}
@@ -1553,6 +1557,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			kicked_ids = kickedList,
 			votekicked_ids = votekickedList,
 			assigned_ids = assignedList,
+			admin_acked = adminList,
 			moments = pendingMoments,
 			rejoin_ids = rejoinList,
 		}, ids
@@ -1688,7 +1693,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	end
 
 	-- a team voted a teammate out in Discord: kick them (long lockout), drop them from the round counts, and never let them back in this match
-	local function applyVotekick(id)
+	local function applyVotekick(id, reason)
 		if voteKicked[id] or phase ~= "LIVE" then return end
 		local info = matchRoster[id]
 		if not info then return end
@@ -1697,7 +1702,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		timelineEvent("votekick", id)
 		leftIds[id] = true -- the enforce loop benches and kicks them again if they return before the match ends
 		PlayerTeams[info.name] = nil
-		say(info.name .. " vote-kicked")
+		say(info.name .. " " .. (reason or "vote-kicked"))
 		local p = Players:GetPlayerByUserId(id)
 		if p then kick(p, false, VOTEKICK_DURATION) end
 		syncNow = true
@@ -1744,6 +1749,20 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		end
 		for id in pairs(assignedAck) do
 			if not resent[id] then assignedAck[id] = nil end
+		end
+		local resentKeys = {}
+		for _, cmd in ipairs(data.admin or {}) do
+			if type(cmd) == "table" and cmd.key then
+				resentKeys[cmd.key] = true
+				if not adminAck[cmd.key] then
+					adminAck[cmd.key] = true -- acknowledged even if it failed, so it never runs twice
+					local ok, err = pcall(Agent.admin, cmd)
+					if not ok then warn("[SCRIM] admin " .. tostring(cmd.action) .. " failed: " .. tostring(err)) end
+				end
+			end
+		end
+		for key in pairs(adminAck) do
+			if not resentKeys[key] then adminAck[key] = nil end
 		end
 	end
 
@@ -1950,7 +1969,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		leftAt, voteKicked = {}, {}
 		teamOrder = { [TEAM_A_NAME] = {}, [TEAM_B_NAME] = {} }
 		draftId, draftDone, draftApplied = nil, false, {}
-		countdownEnds, latched, locking, lobbyFloor = nil, false, false, 0
+		countdownEnds, latched, locking, lobbyFloor, forceStart = nil, false, false, 0, false
 		setPhase("LOBBY")
 	end
 
@@ -2266,7 +2285,8 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			return
 		end
 		local roster = lobbyRoster()
-		local perSide = Rules.teamSize(#roster, cfg.min_players)
+		local perSide = Rules.teamSize(#roster, forceStart and 2 or cfg.min_players)
+		forceStart = false
 		if perSide == 0 then
 			say(string.format("Waiting for players (%d/%d)", #roster, cfg.min_players))
 			countdownEnds, latched, lobbyFloor = nil, false, #roster
@@ -2338,9 +2358,9 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 				startCountdown(n)
 			end
 		elseif phase == "COUNTDOWN" then
-			if n < cfg.min_players then
+			if n < (forceStart and 2 or cfg.min_players) then
 				-- dropped below the minimum: cancel the timer quietly, it restarts when enough players are back
-				countdownEnds, latched = nil, false
+				countdownEnds, latched, forceStart = nil, false, false
 				setPhase("LOBBY")
 				return
 			end
@@ -2400,6 +2420,69 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			stopRound()
 			conclude(winner, { [TEAM_A_NAME] = SeriesScore[TEAM_A_NAME], [TEAM_B_NAME] = SeriesScore[TEAM_B_NAME] }, copyStats(MatchStats), true)
 		end
+	end
+
+	-- from Discord: /scrim console. Each command arrives once (by key); the phase is checked again here because it may have moved on.
+	-- Every remote it fires goes through the jittered action queue like everything else.
+	function Agent.admin(cmd)
+		local action = cmd.action
+		local p = type(cmd.id) == "number" and Players:GetPlayerByUserId(cmd.id) or nil
+		local function currentScore() return { [TEAM_A_NAME] = SeriesScore[TEAM_A_NAME], [TEAM_B_NAME] = SeriesScore[TEAM_B_NAME] } end
+		print("[SCRIM] admin: " .. tostring(action) .. (p and (" " .. p.Name) or ""))
+		if action == "force_start" then
+			if (phase ~= "LOBBY" and phase ~= "COUNTDOWN") or locking then return end
+			local n = #lobbyRoster()
+			if n < 2 then return say("Force start needs 2 verified players") end
+			forceStart = true
+			if phase == "LOBBY" then startCountdown(n) end
+			countdownEnds = os.clock() -- lobbyTick locks on its next tick
+		elseif action == "skip_break" then
+			if phase == "BREAK" then breakEnds = os.clock() end
+		elseif action == "restart_round" then
+			if phase ~= "LIVE" or not SeriesActive then return end
+			say("Round restarted by admin")
+			task.spawn(startNextRound)
+		elseif action == "abort" then
+			if phase ~= "COUNTDOWN" and phase ~= "CAPTAINS" and phase ~= "DRAFT" and phase ~= "LIVE" then return end
+			if phase == "LIVE" or phase == "CAPTAINS" then
+				SeriesActive = false
+				stopRound()
+			end
+			abortToLobby("Match cancelled by admin") -- the bot logs a cancelled live match as aborted (no rating change)
+		elseif action == "end" then
+			if phase ~= "LIVE" or (cmd.team ~= TEAM_A_NAME and cmd.team ~= TEAM_B_NAME) then return end
+			SeriesActive = false
+			stopRound()
+			conclude(cmd.team, currentScore(), copyStats(MatchStats), true)
+		elseif action == "score" then
+			if phase ~= "LIVE" or type(cmd.score) ~= "table" then return end
+			local a, b = tonumber(cmd.score[TEAM_A_NAME]) or 0, tonumber(cmd.score[TEAM_B_NAME]) or 0
+			SeriesScore[TEAM_A_NAME], SeriesScore[TEAM_B_NAME] = a, b
+			say(string.format("Score set: %s %d - %d %s", TEAM_A_NAME, a, b, TEAM_B_NAME))
+			if Rules.isMatchOver(a, b, SeriesPerSide) then
+				SeriesActive = false
+				stopRound()
+				conclude(a > b and TEAM_A_NAME or TEAM_B_NAME, currentScore(), copyStats(MatchStats), false)
+			end
+		elseif action == "announce" then
+			if type(cmd.text) == "string" then say(cmd.text) end
+		elseif action == "kick" then
+			if not p then return end
+			local id = p.UserId
+			if phase == "LIVE" and matchRoster[id] then
+				applyVotekick(id, "kicked by admin") -- off the team and kept out until the match ends
+			else
+				if lockedIds[id] then leftIds[id] = true end -- a locked player cannot come back this match
+				kick(p, false, KICK_DURATION)
+			end
+		elseif action == "bench" then
+			if not p or timedOut[p.UserId] then return end
+			timedOut[p.UserId] = true -- released with everyone else when the match ends
+			Act.timeout(p.UserId, true, true)
+		elseif action == "unbench" then
+			if p and timedOut[p.UserId] then releaseTimeout(p.UserId, true) end
+		end
+		syncNow = true
 	end
 
 	local function safe(fn)
