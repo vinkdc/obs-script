@@ -302,8 +302,23 @@ UI.IgnoreGuiInset = true
 pcall(function() UI.Parent = game:GetService("CoreGui") end)
 if not UI.Parent then UI.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
+-- every event connection goes through on() so Unload can disconnect them (a re-run must not leave the old copy's handlers running)
+local Conns = {}
+local function on(signal, fn)
+	local c = signal:Connect(fn)
+	if #Conns >= 500 then -- per-character connections die with the character: drop those so the list doesn't grow forever
+		local live = {}
+		for _, old in ipairs(Conns) do if old.Connected then table.insert(live, old) end end
+		Conns = live
+	end
+	table.insert(Conns, c)
+	return c
+end
+
 local Unload = function()
 	Running = false
+	for _, c in ipairs(Conns) do c:Disconnect() end
+	table.clear(Conns)
 	UI:Destroy()
 end
 do
@@ -631,7 +646,7 @@ local function hookKOs(player)
 	if not stat or not stat:IsA("ValueBase") then return end
 	koTracking = true
 	local last = stat.Value
-	stat:GetPropertyChangedSignal("Value"):Connect(function()
+	on(stat:GetPropertyChangedSignal("Value"), function()
 		local v = stat.Value
 		if type(v) == "number" and type(last) == "number" and v > last and RoundActive and SeriesActive then -- SeriesActive: not during the captain rounds
 			table.insert(koEvents, { name = player.Name, t = os.clock(), left = v - last })
@@ -851,12 +866,12 @@ local function setupPlayerTracker(player)
 
 	local function hookBackpack(bp)
 		if not bp then return end
-		bp.ChildAdded:Connect(fireUpdate)
-		bp.ChildRemoved:Connect(fireUpdate)
+		on(bp.ChildAdded, fireUpdate)
+		on(bp.ChildRemoved, fireUpdate)
 	end
 
 	hookBackpack(player:FindFirstChild("Backpack"))
-	player.ChildAdded:Connect(function(child)
+	on(player.ChildAdded, function(child)
 		if child.Name == "Backpack" then
 			hookBackpack(child)
 			fireUpdate()
@@ -940,26 +955,26 @@ local function setupPlayerTracker(player)
 
 		local updateBindable = Instance.new("BindableEvent")
 		updateBindable.Name = "UpdateToolStatusBindable"
-		updateBindable.Event:Connect(updateToolStatus)
+		on(updateBindable.Event, updateToolStatus)
 		updateBindable.Parent = character
 
 		updateToolStatus()
-		character.ChildAdded:Connect(updateToolStatus)
-		character.ChildRemoved:Connect(updateToolStatus)
+		on(character.ChildAdded, updateToolStatus)
+		on(character.ChildRemoved, updateToolStatus)
 
-		humanoid.Died:Connect(function() handleDeath(player.Name) end)
-		character.AncestryChanged:Connect(function(_, parent)
+		on(humanoid.Died, function() handleDeath(player.Name) end)
+		on(character.AncestryChanged, function(_, parent)
 			-- a character removed while still alive is the game resetting the round, not a death
 			if not parent and humanoid.Health <= 0 then handleDeath(player.Name) end
 		end)
 	end
 
 	if player.Character then task.spawn(setupCharacter, player.Character) end
-	player.CharacterAdded:Connect(setupCharacter)
+	on(player.CharacterAdded, setupCharacter)
 end
 
 for _, player in ipairs(Players:GetPlayers()) do setupPlayerTracker(player) end
-Players.PlayerAdded:Connect(setupPlayerTracker)
+on(Players.PlayerAdded, setupPlayerTracker)
 
 --// =========================================================
 --// ROUND DETECTOR
@@ -1054,17 +1069,17 @@ local function hookPlayerTeam(player)
 		wasPlaying = nowPlaying
 		checkRoundState()
 	end
-	player:GetPropertyChangedSignal("Team"):Connect(onTeamChanged)
-	player:GetPropertyChangedSignal("Neutral"):Connect(checkRoundState)
+	on(player:GetPropertyChangedSignal("Team"), onTeamChanged)
+	on(player:GetPropertyChangedSignal("Neutral"), checkRoundState)
 	task.spawn(hookKOs, player)
 end
 
 for _, player in ipairs(Players:GetPlayers()) do hookPlayerTeam(player) end
-Players.PlayerAdded:Connect(function(player)
+on(Players.PlayerAdded, function(player)
 	hookPlayerTeam(player)
 	task.defer(checkRoundState)
 end)
-Players.PlayerRemoving:Connect(function(player)
+on(Players.PlayerRemoving, function(player)
 	if RoundActive then handleDeath(player.Name) end
 	task.defer(checkRoundState)
 end)
@@ -2402,7 +2417,7 @@ do
 		end
 	end)
 
-	Players.PlayerAdded:Connect(function(p)
+	on(Players.PlayerAdded, function(p)
 		verifiedCache[p.UserId] = nil -- re-check; they may have verified since last time
 		if leftAt[p.UserId] and phase == "LIVE" then timelineEvent("rejoin", p.UserId) end
 		leftAt[p.UserId] = nil -- back within the grace period
@@ -2413,7 +2428,7 @@ do
 		end
 		syncNow = true
 	end)
-	Players.PlayerRemoving:Connect(function(p)
+	on(Players.PlayerRemoving, function(p)
 		if lockedIds[p.UserId] and (phase == "CAPTAINS" or phase == "DRAFT" or phase == "LIVE" or phase == "POSTGAME") then
 			if not voteKicked[p.UserId] then
 				leftAt[p.UserId] = os.clock()
