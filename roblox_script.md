@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.2.0" -- bump on every edit
+local SCRIPT_VERSION = "1.2.1" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -1093,7 +1093,9 @@ task.defer(checkRoundState)
 local HttpService = game:GetService("HttpService")
 local httpRequest = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
 
-do
+-- the agent runs in its own function: as a plain do-block its ~110 locals shared the main chunk's 255-register limit
+-- with the ~130 above, and going over makes the script fail to compile (the loader's loadstring then returns nil)
+;(function()
 	local agentEnabled = true
 	if not httpRequest then
 		warn("[SCRIM] This executor has no HTTP request function; the scrim agent is disabled.")
@@ -2473,6 +2475,6 @@ do
 
 	print(string.format("[SCRIM] API %s | remote gap %.1fs | kick lockout %s | DRY_RUN %s", API_URL, ACTION_GAP, tostring(KICK_DURATION), tostring(DRY_RUN)))
 	print("[SCRIM] Agent ready. Waiting for /scrim start" .. (DRY_RUN and " (DRY RUN: no remotes are fired)" or ""))
-end
+end)()
 
 print("[BOMB TRACKER] Loaded.")
