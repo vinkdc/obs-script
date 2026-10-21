@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.1.12" -- bump on every edit
+local SCRIPT_VERSION = "1.2.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -35,7 +35,8 @@ local VOTEKICK_DURATION = 10                    -- lockout minutes for a player 
 local FORFEIT_SECONDS = 180                    -- a team with nobody in the server this long forfeits the live match
 local ACTION_GAP = 1.5                          -- seconds between ANY two game remotes (kick, timeout, announce, start/stop)
 local ACTION_JITTER = 0.5                        -- extra random 0..N seconds added to every gap (gap is never below ACTION_GAP)
-local ANNOUNCE_GAP = 2.4                           -- min seconds between two announcements (the game ignores one fired while the last is still fading, ~2s)
+local ANNOUNCE_WORD_SECONDS = 0.2                  -- the game types an announcement word by word; seconds per word (tune to match)
+local ANNOUNCE_FADE = 2                            -- seconds it stays and fades after the last word (the game ignores a new one until then)
 local ANNOUNCE_JITTER = 0.4
 local MAX_ANNOUNCE_QUEUE = 20                       -- pending announcements cap (oldest dropped)
 local function jitteredGap() return ACTION_GAP + math.random() * ACTION_JITTER end
@@ -127,6 +128,7 @@ local Act = {
 	fire = function(...) AnnounceEvent:FireServer(...) end,
 	fireFirst = function(...) AnnounceEvent:FireServer(...) end,
 	announce = function(msg) AnnounceEvent:FireServer("SendMessage", msg) end,
+	announceNow = function(msg) AnnounceEvent:FireServer("SendMessage", msg) end,
 }
 local Agent = { active = false }
 
@@ -452,8 +454,8 @@ local function getAliveCount(teamName)
 	return n
 end
 
-local function broadcastMessage(msg)
-	Act.announce(msg)
+local function broadcastMessage(msg) -- round results: jump the queue so the score shows as soon as the round ends
+	Act.announceNow(msg)
 	print("[GAMELOOP] " .. msg)
 end
 
@@ -522,7 +524,7 @@ local function checkRoundWinner()
 			elseif bombTeam == TEAM_B_NAME then roundWinner = TEAM_A_NAME end
 		end
 		if not roundWinner then
-			broadcastMessage("Round ended in a draw!")
+			broadcastMessage("Draw!")
 			RoundDecided = true
 			timelineRoundEnd(nil, false)
 			task.spawn(startNextRound)
@@ -1119,11 +1121,25 @@ do
 		push(0, tostring(args[1]), function() AnnounceEvent:FireServer(table.unpack(args, 1, args.n)) end)
 	end
 	-- Announcements get their own lane: the game ignores a SendMessage fired while the last one is still fading,
-	-- so they are spaced ANNOUNCE_GAP apart and anything that piled up meanwhile is merged into one message (nothing is dropped).
-	local announceQ, lastAnnounce = {}, 0
+	-- so each waits until the last has typed out and faded, and anything that piled up meanwhile is merged into one message.
+	-- They also cover the screen, so they are held while a round is being played and go out once it is decided.
+	local announceQ, announceBusyUntil, announceUrgent = {}, 0, false
+	local function announceHeld() return RoundActive and not RoundDecided end
+	local function announceDuration(text)
+		local words = select(2, string.gsub(text, "%S+", ""))
+		return words * ANNOUNCE_WORD_SECONDS + ANNOUNCE_FADE
+	end
+	-- true while an announcement is queued or still on screen
+	local function announceBusy() return #announceQ > 0 or os.clock() < announceBusyUntil end
 	Act.announce = function(msg)
 		if #announceQ >= MAX_ANNOUNCE_QUEUE then table.remove(announceQ, 1) end
 		table.insert(announceQ, string.sub(tostring(msg), 1, 200))
+	end
+	-- goes to the front of the announcements and holds the action queue until it is sent (still waits for the last one to fade)
+	Act.announceNow = function(msg)
+		if #announceQ >= MAX_ANNOUNCE_QUEUE then table.remove(announceQ) end
+		table.insert(announceQ, 1, string.sub(tostring(msg), 1, 200))
+		announceUrgent = true
 	end
 	local kickTimes = {}
 	Act.kick = function(userId, minutes)
@@ -1147,7 +1163,7 @@ do
 		local args = buildTimeoutArgs(userId, on)
 		push(urgent and 0 or 2, "timeout " .. tostring(userId) .. " " .. tostring(on), function() AnnounceEvent:FireServer(table.unpack(args)) end, not on)
 	end
-	Act.clear = function() table.clear(queue) table.clear(announceQ) end
+	Act.clear = function() table.clear(queue) table.clear(announceQ) announceUrgent = false end
 	Act.drain = function()
 		while Running and #queue > 0 do task.wait(0.25) end
 		task.wait(jitteredGap())
@@ -1161,7 +1177,11 @@ do
 
 	task.spawn(function()
 		while Running do
-			local item = table.remove(queue, 1)
+			local item = queue[1]
+			if announceUrgent and not announceHeld() then item = nil end -- an urgent announcement goes out before the next remote
+			-- a round only starts once the screen is clear, so no announcement is still showing when play begins
+			if item and item.label == "StartMinigame" and announceBusy() then item = nil end
+			if item then table.remove(queue, 1) end
 			if not item then
 				task.wait(0.1)
 			else
@@ -1180,21 +1200,23 @@ do
 
 	task.spawn(function()
 		while Running do
-			if #announceQ == 0 then
+			if #announceQ == 0 or announceHeld() then
 				task.wait(0.1)
 			else
-				local wait = math.max(lastAnnounce + ANNOUNCE_GAP + math.random() * ANNOUNCE_JITTER, lastFire + jitteredGap()) - os.clock()
+				local wait = math.max(announceBusyUntil + math.random() * ANNOUNCE_JITTER, lastFire + jitteredGap()) - os.clock()
 				if wait > 0 then
 					task.wait(wait)
 				end
-				-- merge everything that queued up while waiting (up to the 200 char limit), oldest first
+				if announceHeld() then continue end -- a round went live while we waited: keep everything queued until it ends
+				-- merge everything that queued up while waiting (up to the 100 char limit), oldest first
 				local text = table.remove(announceQ, 1) -- nil if Act.clear() ran while waiting
+				announceUrgent = false
 				if not text then continue end
 				while announceQ[1] and #text + 3 + #announceQ[1] <= 100 do
 					text = text .. " | " .. table.remove(announceQ, 1)
 				end
-				lastAnnounce = os.clock()
-				lastFire = lastAnnounce
+				lastFire = os.clock()
+				announceBusyUntil = lastFire + announceDuration(text)
 				if DRY_RUN then
 					print("[DRYRUN] announce: " .. text)
 				else
@@ -1332,7 +1354,7 @@ do
 		timerResetBy[id] = true
 		countdownEnds = os.clock() + cfg.countdown_seconds
 		announced = {}
-		say(string.format("Timer reset to %ds (%d/%d players)", cfg.countdown_seconds, #lobbyRoster(), LOBBY_CAP))
+		say(string.format("Timer reset: %ds (%d/%d)", cfg.countdown_seconds, #lobbyRoster(), LOBBY_CAP))
 	end
 
 	local function applyVerified(reportedIds, verifiedList)
@@ -1574,7 +1596,7 @@ do
 				local replacement = pool[rng:NextInteger(1, #pool)]
 				setCaptain(team, replacement)
 				releaseTimeout(replacement)
-				say(string.format("%s left. %s is the new %s captain.", c.name, nameOf(replacement), team))
+				say(string.format("New %s captain: %s", team, nameOf(replacement)))
 			end
 		end
 		return true
@@ -1622,7 +1644,7 @@ do
 		liveSince, roundSeen, startRetries = os.clock(), false, 0
 		absentSince, absentWarned = {}, {}
 		setPhase("LIVE")
-		say(string.format("Match resumed: %s %d - %d %s", TEAM_A_NAME, SeriesScore[TEAM_A_NAME], SeriesScore[TEAM_B_NAME], TEAM_B_NAME))
+		say(string.format("Resumed: %s %d - %d %s", TEAM_A_NAME, SeriesScore[TEAM_A_NAME], SeriesScore[TEAM_B_NAME], TEAM_B_NAME))
 		task.spawn(startNextRound) -- the round that was running is not tracked: stop it and start a fresh one at the same score
 	end
 
@@ -1658,7 +1680,7 @@ do
 		timelineEvent("votekick", id)
 		leftIds[id] = true -- the enforce loop benches and kicks them again if they return before the match ends
 		PlayerTeams[info.name] = nil
-		say(string.format("%s was vote-kicked from %s.", info.name, info.team))
+		say(info.name .. " vote-kicked")
 		local p = Players:GetPlayerByUserId(id)
 		if p then kick(p, false, VOTEKICK_DURATION) end
 		syncNow = true
@@ -1788,7 +1810,7 @@ do
 		setPhase("POSTGAME")
 
 		task.spawn(function()
-			say(string.format("%s wins %d-%d%s! Results are posted in Discord.", winnerTeam, math.max(a, b), math.min(a, b), forfeit and " (forfeit)" or ""))
+			say(string.format("%s wins %d-%d%s!", winnerTeam, math.max(a, b), math.min(a, b), forfeit and " (forfeit)" or ""))
 			task.wait(3)
 			releaseAllTimeouts() -- timeouts persist across rejoin, so clear them before everyone is kicked
 			for _, p in ipairs(presentPlayers()) do kick(p) end -- everyone leaves, one per ACTION_GAP
@@ -1856,7 +1878,7 @@ do
 		ensureStats(p.Name)
 		updatePlayerNametag(p)
 		releaseTimeout(id, true)
-		say(string.format("%s was added to %s.", p.Name, team))
+		say(string.format("%s joined %s", p.Name, team))
 		syncNow = true
 	end
 	;(getgenv and getgenv() or _G).ScrimAssign = Agent.assign
@@ -1869,7 +1891,7 @@ do
 		timerResetBy = {}
 		for _, p in ipairs(lobbyRoster()) do timerResetBy[p.UserId] = true end
 		latched = n >= LOBBY_CAP
-		say(string.format("Scrim starts in %ds (%d/%d players)", cfg.countdown_seconds, n, LOBBY_CAP))
+		say(string.format("Starting in %ds (%d/%d)", cfg.countdown_seconds, n, LOBBY_CAP))
 	end
 
 	local function newMatchId()
@@ -1895,7 +1917,7 @@ do
 		end
 		SeriesPerSide = math.max(perSide, 1)
 		setPhase("LIVE")
-		say(TEAM_A_NAME .. " 0 - 0 " .. TEAM_B_NAME .. " (first to " .. Rules.pointsToWin(SeriesPerSide) .. ", win by " .. Rules.WIN_BY .. ")")
+		say(TEAM_A_NAME .. " 0 - 0 " .. TEAM_B_NAME .. " | first to " .. Rules.pointsToWin(SeriesPerSide))
 		Act.fire("ResetKOs") -- clear everyone's KOs (the captain rounds added some) before the first real round
 		Act.fire("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
 	end
@@ -1950,7 +1972,7 @@ do
 		end
 		say(TEAM_A_NAME .. ": " .. table.concat(blackNames, ", "))
 		say(TEAM_B_NAME .. ": " .. table.concat(whiteNames, ", "))
-		if #notPicked > 0 then say("Sitting out this match: " .. table.concat(notPicked, ", ")) end
+		if #notPicked > 0 then say("Sitting out: " .. table.concat(notPicked, ", ")) end
 		Act.drain() -- timeouts and kicks finish (one per ACTION_GAP) before the game starts
 		beginLive()
 	end
@@ -2047,13 +2069,13 @@ do
 			if kind == "tie" then
 				tied = value
 			elseif attempt < 3 then
-				say("Round did not start, retrying")
+				say("Retrying round")
 			end
 		end
 		local choices = (tied and #tied > 0) and tied or eligible
 		if #choices == 0 then return nil end
 		local chosen = choices[rng:NextInteger(1, #choices)]
-		say(nameOf(chosen) .. " is random captain")
+		say("Random captain: " .. nameOf(chosen))
 		return chosen
 	end
 
@@ -2086,7 +2108,7 @@ do
 			timedOut[id] = true
 			Act.timeout(id, true)
 			warn(string.format("[SCRIM] %s benched to even the teams (%d vs %d present)", name, #a, #b))
-			say(name .. " sits out to keep the teams even.")
+			say(name .. " sits out")
 		end
 
 		local benched = {}
@@ -2100,7 +2122,7 @@ do
 				end
 			end
 		end
-		if #benched > 0 then say("Sitting out this match: " .. table.concat(benched, ", ")) end
+		if #benched > 0 then say("Sitting out: " .. table.concat(benched, ", ")) end
 		Act.drain() -- timeouts/releases finish (one per ACTION_GAP) before the game starts
 		if phase ~= "DRAFT" then return end
 		beginLive()
@@ -2121,13 +2143,13 @@ do
 		setCaptain(TEAM_B_NAME, secondCaptain)
 		draftId, draftDone, draftApplied, draftPerSide = newMatchId(), false, {}, perSide
 		setPhase("DRAFT")
-		say(string.format("Draft: captains pick in Discord (%ds)", cfg.pick_seconds))
+		say(string.format("Draft started (%ds)", cfg.pick_seconds))
 
 		local started = os.clock()
 		local limit = cfg.pick_seconds * perSide * 2 + 120 -- only reached if the bot stops answering
 		while Running and phase == "DRAFT" and not draftDone do
 			if not ensureCaptains() then
-				abortToLobby("A captain left and nobody is left to replace them. Back to the lobby.")
+				abortToLobby("Captain left. Back to lobby")
 				return
 			end
 			if os.clock() - started > limit then break end
@@ -2146,7 +2168,7 @@ do
 		matchRoster, PlayerTeams = {}, {}
 		if RoundActive then endCaptainRound() end -- a practice round must be fully over before anonymous mode is toggled
 		setAnonymous(true)
-		say("Captain rounds: last one standing")
+		say("Captain rounds")
 		Act.drainUrgent() -- the toggle goes out first (ahead of any kick backlog)...
 		task.wait(ANONYMOUS_SETTLE) -- ...and the game gets a moment to apply it before round 1 begins
 		local winners = {}
@@ -2180,13 +2202,13 @@ do
 			local id = playCaptainRound(round == 2 and winners[1] or nil)
 			benching = false
 			if not id then
-				if phase == "CAPTAINS" then abortToLobby("Could not choose a captain. Back to the lobby.") end
+				if phase == "CAPTAINS" then abortToLobby("No captain. Back to lobby") end
 				return
 			end
 			winners[round] = id
 			local team = round == 1 and TEAM_A_NAME or TEAM_B_NAME
 			captains[team] = { id = id, name = nameOf(id) }
-			say(string.format("%s is %s captain", nameOf(id), team))
+			say(string.format("%s captain: %s", team, nameOf(id)))
 		end
 		if phase ~= "CAPTAINS" then
 			setAnonymous(false) -- same as before the duel existed: anonymous mode never stays on after the rounds
@@ -2208,7 +2230,7 @@ do
 		Act.drainUrgent()
 		local first = playCaptainRound(nil, { a, b })
 		if not first then
-			if phase == "CAPTAINS" then abortToLobby("Could not decide who picks first. Back to the lobby.") end
+			if phase == "CAPTAINS" then abortToLobby("No first pick. Back to lobby") end
 			return
 		end
 		local second = first == a and b or a
@@ -2229,7 +2251,7 @@ do
 		local roster = lobbyRoster()
 		local perSide = Rules.teamSize(#roster, cfg.min_players)
 		if perSide == 0 then
-			say(string.format("Need %d verified players (have %d). Waiting...", cfg.min_players, #roster))
+			say(string.format("Waiting for players (%d/%d)", #roster, cfg.min_players))
 			countdownEnds, latched, lobbyFloor = nil, false, #roster
 			locking = false
 			setPhase("LOBBY")
@@ -2279,7 +2301,7 @@ do
 		end
 		if RoundActive or now < practiceNextAt or #lobbyRoster() < PRACTICE_MIN_PLAYERS then return end
 		practiceStartedAt, practiceSeen = now, false
-		say("PRACTICE ROUND")
+		say("Practice round")
 		-- the queue can be behind (kicks, timeouts): if the lobby has moved on by then, a late practice round must not start
 		Act.fireIf(function() return phase == "LOBBY" and practiceStartedAt ~= nil end, "StartMinigame", "Timebomb", "LeagueStandard", "Normal")
 	end
@@ -2310,7 +2332,7 @@ do
 			for _, t in ipairs({ 20, 10, 5 }) do
 				if left <= t and not announced[t] and cfg.countdown_seconds > t then
 					announced[t] = true
-					say(string.format("Scrim starts in %ds (%d/%d players)", t, n, LOBBY_CAP))
+					say(string.format("Starting in %ds (%d/%d)", t, n, LOBBY_CAP))
 				end
 			end
 			if left <= 0 then task.spawn(lockAndStart) end
@@ -2345,7 +2367,7 @@ do
 			local waited = absentFor(team)
 			if waited >= FORFEIT_SECONDS / 2 and waited < FORFEIT_SECONDS and not absentWarned[team] then
 				absentWarned[team] = true
-				say(string.format("%s has nobody in the server. Forfeit in %ds unless someone rejoins.", team, math.ceil(FORFEIT_SECONDS - waited)))
+				say(string.format("%s empty. Forfeit in %ds", team, math.ceil(FORFEIT_SECONDS - waited)))
 			end
 		end
 		local aGone, bGone = absentFor(TEAM_A_NAME) >= FORFEIT_SECONDS, absentFor(TEAM_B_NAME) >= FORFEIT_SECONDS
