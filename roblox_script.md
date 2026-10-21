@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.6.0" -- bump on every edit
+local SCRIPT_VERSION = "1.7.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -477,6 +477,14 @@ end
 
 local checkRoundState -- forward declaration
 
+-- match round mode, set from Discord (/scrim config mode or the console): 0 = normal, 1 = shrink
+local ROUND_MODES = { [0] = { "LeagueStandard", "Normal" }, [1] = { "Shrink", "Multi" } }
+local GameMode = 0
+local function roundArgs()
+	local m = ROUND_MODES[GameMode] or ROUND_MODES[0]
+	return "StartMinigame", "Timebomb", m[1], m[2]
+end
+
 local LastStopAt = -100 -- when we last stopped a round: team removals right after it are not deaths
 
 local function stopRound()
@@ -503,7 +511,7 @@ local function nextRound()
 	if not SeriesActive then return end
 	if Agent.beforeRound then Agent.beforeRound() end -- bench latecomers before the next bomb round
 	if not SeriesActive then return end -- clearing the field can take up to 30s
-	Act.fire("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
+	Act.fire(roundArgs())
 	print("[GAMELOOP] Next round started")
 
 	-- If the server never emptied the Playing team, force a fresh round state
@@ -1259,7 +1267,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	if not agentEnabled then return end
 
 	--// ---- state ----
-	local cfg = { min_players = 4, break_seconds = 180, verify_grace_seconds = 20, countdown_seconds = 30, captains = 1, pick_seconds = 30 }
+	local cfg = { min_players = 4, break_seconds = 180, verify_grace_seconds = 20, countdown_seconds = 30, captains = 1, pick_seconds = 30, mode = 0 }
 	local phase = "IDLE"
 	local sessionId = nil
 	local countdownEnds, breakEnds = nil, nil
@@ -1744,6 +1752,10 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			for key in pairs(cfg) do
 				if type(data.config[key]) == "number" then cfg[key] = data.config[key] end
 			end
+			if cfg.mode ~= GameMode then
+				GameMode = cfg.mode
+				if phase ~= "IDLE" then say("Mode: " .. (GameMode == 1 and "Shrink" or "Normal") .. " (from the next round)") end
+			end
 		end
 		applyVerified(reportedIds, data.verified)
 		-- a player kicked as unverified has since verified in Discord: lift their kick timer (only between matches)
@@ -1989,7 +2001,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		setPhase("LIVE")
 		say(TEAM_A_NAME .. " 0 - 0 " .. TEAM_B_NAME .. " | first to " .. Rules.pointsToWin(SeriesPerSide))
 		Act.fire("ResetKOs") -- clear everyone's KOs (the captain rounds added some) before the first real round
-		Act.fire("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
+		Act.fire(roundArgs())
 	end
 
 	local function abortToLobby(reason)
@@ -2380,7 +2392,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		practiceStartedAt, practiceSeen = now, false
 		say("Practice round")
 		-- the queue can be behind (kicks, timeouts): if the lobby has moved on by then, a late practice round must not start
-		Act.fireIf(function() return phase == "LOBBY" and practiceStartedAt ~= nil end, "StartMinigame", "Timebomb", "LeagueStandard", "Normal")
+		Act.fireIf(function() return phase == "LOBBY" and practiceStartedAt ~= nil end, roundArgs())
 	end
 
 	local function lobbyTick()
@@ -2428,7 +2440,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			startRetries += 1
 			liveSince = os.clock()
 			warn("[SCRIM] no round started, firing StartMinigame again")
-			Act.fire("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
+			Act.fire(roundArgs())
 		end
 
 		-- a team with nobody in the server (disconnected players may still rejoin) forfeits after FORFEIT_SECONDS
