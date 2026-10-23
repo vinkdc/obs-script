@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.7.1" -- bump on every edit
+local SCRIPT_VERSION = "1.7.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -20,7 +20,7 @@ local TEAM_B_NAME = "White"
 --// =========================================================
 --// SCRIM SETTINGS (fill these in)
 --// =========================================================
-local API_URL = "https://clip-hosting-o361.onrender.com" -- your clip-hosting site (it relays to the bot through Mongo), no trailing slash
+local API_URL = "https://atlclips.site" -- your clip-hosting site (it relays to the bot through Mongo), no trailing slash
 local API_SECRET = "71fefba29e4dadfc22e9af5d690ae7f82e0687eada0d53702519c6cb653efaf4" -- the ROBLOX_WEBHOOK_SECRET stored in Mongo (config > api_keys) or in clip-hosting's env
 local DRY_RUN = false                           -- true = print every remote instead of firing it (safe test)
 local LOBBY_CAP = 10                            -- timer stops resetting once this many verified players are in
