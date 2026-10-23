@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.7.0" -- bump on every edit
+local SCRIPT_VERSION = "1.9.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -51,6 +51,9 @@ local MAX_BOMB_HISTORY = 20                      -- bomb-holder chain cap
 local FUSE_SECONDS = 10                          -- the bomb always explodes 10s after the fuse resets (every explosion)
 local HOT_PASS_WINDOW = 2                        -- receiving the bomb with this many seconds or less left on the fuse and passing it to an enemy is a hot pass (late track)
 local MAX_PENDING_FINALS = 10                    -- unacked match results kept while the bot is unreachable
+local SYNC_STALE_SECONDS = 10                    -- no good sync for this long = verification data is stale: no lock, no unverified kicks
+local LOCK_HOLD_SECONDS = 5                      -- a lock that cannot go ahead safely is retried after this long
+local MAX_UNCHECKED_HOLDS = 3                    -- times a lock waits for players whose verification has not come back yet
 local MAX_KICKS_PER_MINUTE = 25                 -- safety valve: a bug can never mass-kick the server
 -- Staff / spectator accounts the script must never count, kick or time out: [userId] = true
 local IGNORED_USER_IDS = {
@@ -1312,9 +1315,21 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local pendingMoments = {} -- ace / clutch / flawless announcements, sent with every sync until the bot acks their key
 	local syncNow, syncCount = false, 0
 	local syncStatus = "starting"
+	local lastSyncOkAt = -math.huge -- os.clock() of the last sync the bot answered
+	local lockHolds, botWaitSaid = 0, false
+	local allowedNames = {} -- [lowercase name] = true: /scrim allow; joins a locked match benched instead of kicked
 	local rng = Random.new()
 
 	local function say(msg) Act.announce(msg) end
+	-- verification data is only trusted while the bot is answering (a deploy or outage leaves it stale)
+	local function syncFresh() return os.clock() - lastSyncOkAt < SYNC_STALE_SECONDS end
+	-- on the /scrim allow list (a kick by an admin or a vote still keeps them out)
+	local function isAllowed(p) return allowedNames[string.lower(p.Name)] == true and not leftIds[p.UserId] end
+	local function bench(id)
+		if timedOut[id] then return end
+		timedOut[id] = true -- released with everyone else when the match ends
+		Act.timeout(id, true)
+	end
 
 	local function setPhase(p)
 		phase = p
@@ -1389,12 +1404,9 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	--// ---- verification + joins ----
 	local function onVerifiedJoin(id)
 		if phase ~= "COUNTDOWN" or latched or locking then return end
-		if timerResetBy[id] then
-			-- already in the lobby (or already reset the timer) this countdown: leaving and rejoining to stall it gets them kicked
-			local p = Players:GetPlayerByUserId(id)
-			if p then kick(p, false, KICK_DURATION) end
-			return
-		end
+		-- already in the lobby (or already reset the timer) this countdown: a rejoin does not reset it again, so leaving
+		-- and rejoining cannot stall it (no kick: a crash or lost connection must not lock a player out)
+		if timerResetBy[id] then return end
 		timerResetBy[id] = true
 		countdownEnds = os.clock() + cfg.countdown_seconds
 		announced = {}
@@ -1437,8 +1449,8 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 						Act.timeout(id, true, true)
 						timeoutedThisTick = true
 					end
-					-- then the kick, paced like the unverified kicks (no longer lockout)
-					if not kickedThisTick and now >= nextKickAt then
+					-- then the kick, paced like the unverified kicks (no longer lockout); /scrim allow players stay, benched
+					if not isAllowed(p) and not kickedThisTick and now >= nextKickAt then
 						kick(p)
 						kickedThisTick = true
 						nextKickAt = now + KICK_SPACING + math.random() * KICK_JITTER
@@ -1446,14 +1458,15 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 				end
 			elseif verifiedCache[id] == true then
 				warnedAt[id] = nil
-			elseif verifiedCache[id] == false then
+			elseif verifiedCache[id] == false and not isAllowed(p) then
 				if not warnedAt[id] then
 					warnedAt[id] = now
 					say(p.Name .. " is unverified")
 				end
 				-- per-player grace jitter (stable per user id) so simultaneous joiners don't expire together
 				local grace = cfg.verify_grace_seconds + (id % 1000) / 1000 * KICK_JITTER
-				if now - warnedAt[id] >= grace and not kickedThisTick and now >= nextKickAt then
+				-- no kick while the bot is unreachable: they may have verified and we would not know
+				if now - warnedAt[id] >= grace and syncFresh() and not kickedThisTick and now >= nextKickAt then
 					kick(p, true)
 					kickedThisTick = true
 					nextKickAt = now + KICK_SPACING + math.random() * KICK_JITTER
@@ -1547,6 +1560,8 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		for id in pairs(voteKicked) do table.insert(votekickedList, id) end
 		local kickedList = {}
 		for id in pairs(kickedUnverified) do table.insert(kickedList, id) end
+		local lockoutList = {}
+		for id in pairs(kickedIds) do table.insert(lockoutList, id) end
 		local caps = nil
 		if next(captains) ~= nil and (phase == "CAPTAINS" or phase == "DRAFT") then
 			caps = {}
@@ -1583,6 +1598,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			draft = draftInfo,
 			finals = pendingFinals,
 			kicked_ids = kickedList,
+			lockout_ids = lockoutList, -- kept by the bot so a restarted script can still lift these kicks
 			votekicked_ids = votekickedList,
 			assigned_ids = assignedList,
 			admin_acked = adminList,
@@ -1699,17 +1715,22 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		task.spawn(startNextRound) -- the round that was running is not tracked: stop it and start a fresh one at the same score
 	end
 
-	local function applySession(info, staleTimeouts, resume)
+	local function applySession(info, staleTimeouts, resume, lockouts)
 		if not info then return end
 		if info.active then
 			if sessionId ~= info.id and phase == "IDLE" and type(resume) == "table" and resume.match_id then
 				sessionId = info.id
 				resumeMatch(resume)
+				for _, id in ipairs(lockouts or {}) do kickedIds[id] = true end -- a previous run's kicks: lifted when this match ends
 			elseif sessionId ~= info.id then
 				if phase == "LIVE" or phase == "CAPTAINS" then stopRound() end
 				resetAll()
 				sessionId = info.id
 				for _, id in ipairs(staleTimeouts or {}) do releaseTimeout(id) end
+				for _, id in ipairs(lockouts or {}) do -- a previous run's kicks: its match is gone, so lift them now
+					kickedIds[id] = nil
+					Act.unkick(id)
+				end
 				setPhase("LOBBY")
 			end
 		elseif phase ~= "IDLE" then
@@ -1757,7 +1778,13 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 				if phase ~= "IDLE" then say("Mode: " .. (GameMode == 1 and "Shrink" or "Normal") .. " (from the next round)") end
 			end
 		end
-		applyVerified(reportedIds, data.verified)
+		-- only a response to our own session carries a real verified list (a restarted script gets none until it joins)
+		local sessionMatched = type(data.session) == "table" and data.session.active and data.session.id == sessionId
+		if sessionMatched and type(data.verified) == "table" then applyVerified(reportedIds, data.verified) end
+		if sessionMatched and type(data.allowed) == "table" then
+			allowedNames = {}
+			for _, name in ipairs(data.allowed) do allowedNames[string.lower(tostring(name))] = true end
+		end
 		-- a player kicked as unverified has since verified in Discord: lift their kick timer (only between matches)
 		if phase == "LOBBY" or phase == "COUNTDOWN" or phase == "BREAK" then
 			for _, id in ipairs(data.verified_kicked or {}) do
@@ -1769,7 +1796,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 				end
 			end
 		end
-		applySession(data.session, data.timed_out, data.resume)
+		applySession(data.session, data.timed_out, data.resume, data.lockout_ids)
 		if type(data.draft) == "table" then applyDraft(data.draft) end
 		for _, id in ipairs(data.votekicks or {}) do applyVotekick(id) end
 		local resent = {}
@@ -1808,6 +1835,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			if data then
 				failures = 0
 				syncStatus = "ok"
+				lastSyncOkAt = os.clock()
 				local ok, applyErr = pcall(applyResponse, data, ids)
 				if not ok then warn("[SCRIM] bad sync response: " .. tostring(applyErr)) end
 			else
@@ -1974,6 +2002,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		announced = {}
 		timerResetBy = {}
 		for _, p in ipairs(lobbyRoster()) do timerResetBy[p.UserId] = true end
+		lockHolds, botWaitSaid = 0, false
 		latched = n >= LOBBY_CAP
 		say(string.format("Starting in %ds (%d/%d)", cfg.countdown_seconds, n, LOBBY_CAP))
 	end
@@ -2331,6 +2360,24 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			locking = false -- /scrim stop or a reset happened while syncing
 			return
 		end
+		-- locking kicks everyone not on the roster, so never lock on stale data: with the bot unreachable (a deploy)
+		-- verified players would look unverified. Also give players whose check has not come back a moment.
+		local unchecked = false
+		for _, p in ipairs(presentPlayers()) do
+			if verifiedCache[p.UserId] == nil and not kickPending[p.UserId] then unchecked = true break end
+		end
+		local fresh = syncFresh()
+		if not fresh or (unchecked and lockHolds < MAX_UNCHECKED_HOLDS) then
+			if fresh then lockHolds += 1 end -- a bot outage holds as long as it lasts; unchecked players only briefly
+			if not fresh and not botWaitSaid then
+				botWaitSaid = true
+				say("Waiting for the bot before starting")
+			end
+			countdownEnds = os.clock() + LOCK_HOLD_SECONDS
+			locking = false
+			return
+		end
+		lockHolds, botWaitSaid = 0, false
 		local roster = lobbyRoster()
 		local big = bigStart
 		local perSide = big and math.min(#roster // 2, Rules.MAX_BIG_PER_TEAM) or Rules.teamSize(#roster, forceStart and 2 or cfg.min_players)
@@ -2352,7 +2399,11 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			nameById[p.UserId] = p.Name
 		end
 		for _, p in ipairs(presentPlayers()) do
-			if not lockedIds[p.UserId] then kick(p, true) end
+			-- only a confirmed unverified player is kicked as unverified (lifted once they verify); anyone still unchecked
+			-- after the holds is kicked like a late joiner (lifted when the match ends)
+			if not lockedIds[p.UserId] then
+				if isAllowed(p) then bench(p.UserId) else kick(p, verifiedCache[p.UserId] == false) end
+			end
 		end
 
 		matchUnrated = big
@@ -2489,6 +2540,11 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			locking = false
 			return
 		end
+		if not syncFresh() then -- same as a normal lock: stale verification would kick verified players
+			say("Bot not answering. Try Custom match again in a moment")
+			locking = false
+			return
+		end
 		local present, counts = lobbyRoster(), { [TEAM_A_NAME] = 0, [TEAM_B_NAME] = 0 }
 		for _, p in ipairs(present) do
 			local team = customTeams[p.UserId]
@@ -2520,7 +2576,9 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			end
 		end
 		for _, p in ipairs(presentPlayers()) do
-			if not lockedIds[p.UserId] then kick(p, true) end
+			if not lockedIds[p.UserId] then
+				if isAllowed(p) then bench(p.UserId) else kick(p, verifiedCache[p.UserId] == false) end
+			end
 		end
 		customTeams = {}
 		matchUnrated = true
