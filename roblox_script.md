@@ -36,7 +36,7 @@ local FORFEIT_SECONDS = 180                    -- a team with nobody in the serv
 local ACTION_GAP = 1.5                          -- seconds between ANY two game remotes (kick, timeout, announce, start/stop)
 local ACTION_JITTER = 0.5                        -- extra random 0..N seconds added to every gap (gap is never below ACTION_GAP)
 local ANNOUNCE_WORD_SECONDS = 0.2                  -- the game types an announcement word by word; seconds per word (tune to match)
-local ANNOUNCE_FADE = 2                            -- seconds it stays and fades after the last word (the game ignores a new one until then)
+local ANNOUNCE_FADE = 3                            -- seconds it stays and fades after the last word (the game ignores a new one until then)
 local ANNOUNCE_JITTER = 0.4
 local MAX_ANNOUNCE_QUEUE = 20                       -- pending announcements cap (oldest dropped)
 local function jitteredGap() return ACTION_GAP + math.random() * ACTION_JITTER end
