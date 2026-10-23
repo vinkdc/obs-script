@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.7.0" -- bump on every edit
+local SCRIPT_VERSION = "1.7.1" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
