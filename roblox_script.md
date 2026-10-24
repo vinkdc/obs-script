@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.11.0" -- bump on every edit
+local SCRIPT_VERSION = "1.12.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -20,7 +20,7 @@ local TEAM_B_NAME = "White"
 --// =========================================================
 --// SCRIM SETTINGS (fill these in)
 --// =========================================================
-local API_URL = "https://atlclips.site" -- your clip-hosting site (it relays to the bot through Mongo), no trailing slash
+local API_URL = "https://atlclips.site" -- your clip-hosting site (it forwards to the bot over the server's internal network), no trailing slash
 local API_SECRET = "71fefba29e4dadfc22e9af5d690ae7f82e0687eada0d53702519c6cb653efaf4" -- the ROBLOX_WEBHOOK_SECRET stored in Mongo (config > api_keys) or in clip-hosting's env
 local DRY_RUN = false                           -- true = print every remote instead of firing it (safe test)
 local LOBBY_CAP = 10                            -- timer stops resetting once this many verified players are in
@@ -2742,6 +2742,31 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			Act.timeout(p.UserId, true, true)
 		elseif action == "unbench" then
 			if p and timedOut[p.UserId] then releaseTimeout(p.UserId, true) end
+		elseif action == "unassign" then
+			-- off their team, benched, not kicked (still locked in, so an assign can put them back)
+			if not p then return end
+			local id = p.UserId
+			if phase == "LOBBY" or phase == "COUNTDOWN" then
+				if not customTeams[id] then return end
+				customTeams[id] = nil
+				say(p.Name .. " removed from the custom teams")
+			elseif phase == "DRAFT" or phase == "LIVE" then
+				local info = matchRoster[id]
+				if not info then return end
+				for _, c in pairs(captains) do
+					if phase == "DRAFT" and c.id == id then return say("A captain cannot be taken off their team") end
+				end
+				for i = #teamOrder[info.team], 1, -1 do
+					if teamOrder[info.team][i] == id then table.remove(teamOrder[info.team], i) end
+				end
+				matchRoster[id], PlayerTeams[info.name] = nil, nil
+				updatePlayerNametag(p)
+				if not timedOut[id] then
+					timedOut[id] = true -- released with everyone else when the match ends
+					Act.timeout(id, true, true)
+				end
+				say(info.name .. " taken off " .. info.team)
+			end
 		end
 		syncNow = true
 	end
