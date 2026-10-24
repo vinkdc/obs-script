@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.10.0" -- bump on every edit
+local SCRIPT_VERSION = "1.11.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -51,6 +51,7 @@ local MAX_BOMB_HISTORY = 20                      -- bomb-holder chain cap
 local FUSE_SECONDS = 10                          -- the bomb always explodes 10s after the fuse resets (every explosion)
 local HOT_PASS_WINDOW = 2                        -- receiving the bomb with this many seconds or less left on the fuse and passing it to an enemy is a hot pass (late track)
 local MAX_PENDING_FINALS = 10                    -- unacked match results kept while the bot is unreachable
+local PENDING_FINALS_FILE = "atl_scrim_pending_finals.json" -- executor workspace file holding those results across reloads
 local SYNC_STALE_SECONDS = 10                    -- no good sync for this long = verification data is stale: no lock, no unverified kicks
 local LOCK_HOLD_SECONDS = 5                      -- a lock that cannot go ahead safely is retried after this long
 local MAX_UNCHECKED_HOLDS = 3                    -- times a lock waits for players whose verification has not come back yet
@@ -1312,6 +1313,24 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local teamOrder = { [TEAM_A_NAME] = {}, [TEAM_B_NAME] = {} } -- ids in pick order, captain first
 	local draftId, draftDone, draftApplied, draftPerSide = nil, false, {}, 0
 	local pendingFinals = {} -- sent with every sync until the bot acks the match_id
+	-- also kept on disk, so a reload or crash while the bot is unreachable cannot lose a finished match
+	local function savePendingFinals()
+		if type(writefile) ~= "function" then return end
+		local ok, err = pcall(function() writefile(PENDING_FINALS_FILE, HttpService:JSONEncode(pendingFinals)) end)
+		if not ok then warn("[SCRIM] could not save pending results: " .. tostring(err)) end
+	end
+	do -- results a previous run finished but never got acked
+		local ok, saved = pcall(function()
+			return type(isfile) == "function" and isfile(PENDING_FINALS_FILE) and HttpService:JSONDecode(readfile(PENDING_FINALS_FILE))
+		end)
+		if ok and type(saved) == "table" then
+			for _, f in ipairs(saved) do
+				if type(f) == "table" and f.match_id then table.insert(pendingFinals, f) end
+			end
+			if #pendingFinals > 0 then print("[SCRIM] restored " .. #pendingFinals .. " unsent match result(s)") end
+		end
+	end
+	local hostBlockedSaid = false
 	local pendingMoments = {} -- ace / clutch / flawless announcements, sent with every sync until the bot acks their key
 	local syncNow, syncCount = false, 0
 	local syncStatus = "starting"
@@ -1594,6 +1613,8 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		if Paused then phaseEnds = nil end -- the timer is frozen
 		return {
 			session_id = sessionId,
+			host_id = LocalPlayer.UserId, -- the bot gives one host a lease on the session; other scripts are turned away
+			host_name = LocalPlayer.Name,
 			phase = phase,
 			phase_ends = phaseEnds,
 			match_id = matchId,
@@ -1769,11 +1790,28 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	end
 
 	local function applyResponse(data, reportedIds)
+		local before = #pendingFinals
 		for _, matchIdAcked in ipairs(data.acked or {}) do
 			for i = #pendingFinals, 1, -1 do
 				if pendingFinals[i].match_id == matchIdAcked then table.remove(pendingFinals, i) end
 			end
 		end
+		if #pendingFinals ~= before then savePendingFinals() end
+		if data.host_busy then
+			-- another player's script holds this scrim: stand down quietly (no remotes) instead of fighting over it
+			syncStatus = "BLOCKED: " .. tostring(data.host_busy) .. " is hosting"
+			if not hostBlockedSaid then
+				hostBlockedSaid = true
+				warn("[SCRIM] " .. tostring(data.host_busy) .. " is already hosting this scrim; this script stays idle")
+			end
+			if phase ~= "IDLE" then
+				Act.clear()
+				timedOut, SeriesActive, sessionId = {}, false, nil -- their benches are the active host's to manage
+				setPhase("IDLE")
+			end
+			return
+		end
+		hostBlockedSaid = false
 		for _, key in ipairs(data.acked_moments or {}) do
 			for i = #pendingMoments, 1, -1 do
 				if pendingMoments[i].key == key then table.remove(pendingMoments, i) end
@@ -1923,6 +1961,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		end
 		table.insert(pendingFinals, final)
 		while #pendingFinals > MAX_PENDING_FINALS do table.remove(pendingFinals, 1) end
+		savePendingFinals()
 		Paused = false
 		setPhase("POSTGAME")
 
