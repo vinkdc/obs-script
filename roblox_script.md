@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.9.0" -- bump on every edit
+local SCRIPT_VERSION = "1.10.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -1317,7 +1317,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local syncStatus = "starting"
 	local lastSyncOkAt = -math.huge -- os.clock() of the last sync the bot answered
 	local lockHolds, botWaitSaid = 0, false
-	local allowedNames = {} -- [lowercase name] = true: /scrim allow; joins a locked match benched instead of kicked
+	local allowedNames = {} -- [lowercase name] = true: /scrim allow spectators; always benched, never picked or kicked
 	local rng = Random.new()
 
 	local function say(msg) Act.announce(msg) end
@@ -1361,7 +1361,8 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local function lobbyRoster()
 		local list = {}
 		for _, p in ipairs(presentPlayers()) do
-			if verifiedCache[p.UserId] == true and not kickPending[p.UserId] then table.insert(list, p) end
+			-- spectators (/scrim allow) never count toward the lobby and are never picked
+			if verifiedCache[p.UserId] == true and not kickPending[p.UserId] and not isAllowed(p) then table.insert(list, p) end
 		end
 		return list
 	end
@@ -1439,6 +1440,15 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		for _, p in ipairs(presentPlayers()) do
 			local id = p.UserId
 			if kickPending[id] then continue end
+			if isAllowed(p) and not matchRoster[id] then
+				-- a spectator: benched in every phase, never kicked (an admin can still /scrim assign them in)
+				if not timedOut[id] and not timeoutedThisTick then
+					timedOut[id] = true
+					Act.timeout(id, true, true)
+					timeoutedThisTick = true
+				end
+				continue
+			end
 			if phase == "CAPTAINS" or phase == "DRAFT" or phase == "LIVE" or phase == "POSTGAME" then
 				-- joined after the lock, or left and came back
 				if not lockedIds[id] or leftIds[id] then
@@ -1782,8 +1792,16 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		local sessionMatched = type(data.session) == "table" and data.session.active and data.session.id == sessionId
 		if sessionMatched and type(data.verified) == "table" then applyVerified(reportedIds, data.verified) end
 		if sessionMatched and type(data.allowed) == "table" then
+			local before = allowedNames
 			allowedNames = {}
 			for _, name in ipairs(data.allowed) do allowedNames[string.lower(tostring(name))] = true end
+			-- taken off the spectator list between matches: let them play again (a console bench is left alone)
+			if phase == "LOBBY" or phase == "COUNTDOWN" or phase == "BREAK" then
+				for _, p in ipairs(presentPlayers()) do
+					local name = string.lower(p.Name)
+					if before[name] and not allowedNames[name] and timedOut[p.UserId] then releaseTimeout(p.UserId) end
+				end
+			end
 		end
 		-- a player kicked as unverified has since verified in Discord: lift their kick timer (only between matches)
 		if phase == "LOBBY" or phase == "COUNTDOWN" or phase == "BREAK" then
