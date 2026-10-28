@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.13.1" -- bump on every edit
+local SCRIPT_VERSION = "1.13.2" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -1346,6 +1346,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	local syncStatus = "starting"
 	local lastSyncOkAt = -math.huge -- os.clock() of the last sync the bot answered
 	local lockHolds, botWaitSaid = 0, false
+	local draftMinPlayers = 4 -- the player minimum the current lock used; a draft whose even teams fall below it goes back to the lobby
 	local allowedNames = {} -- [lowercase name] = true: /scrim allow spectators; always benched, never picked or kicked
 	local rng = Random.new()
 
@@ -2289,6 +2290,11 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			warn(string.format("[SCRIM] %s benched to even the teams (%d vs %d present)", name, #a, #b))
 			say(name .. " sits out")
 		end
+		-- someone left during the captain rounds or draft: never shrink a scrim below the lobby minimum (e.g. 2v2 down to 1v1)
+		if #presentMembers(TEAM_A_NAME) * 2 < draftMinPlayers then
+			abortToLobby("Not enough players. Back to lobby")
+			return
+		end
 
 		local benched = {}
 		for id in pairs(lockedIds) do
@@ -2448,6 +2454,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		local roster = lobbyRoster()
 		local big = bigStart
 		local perSide = big and math.min(#roster // 2, Rules.MAX_BIG_PER_TEAM) or Rules.teamSize(#roster, forceStart and 2 or cfg.min_players)
+		draftMinPlayers = forceStart and 2 or cfg.min_players
 		forceStart, bigStart = false, false
 		if perSide == 0 then
 			say(string.format("Waiting for players (%d/%d)", #roster, cfg.min_players))
