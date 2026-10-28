@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.12.0" -- bump on every edit
+local SCRIPT_VERSION = "1.13.0" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -21,7 +21,12 @@ local TEAM_B_NAME = "White"
 --// SCRIM SETTINGS (fill these in)
 --// =========================================================
 local API_URL = "https://atlclips.site" -- your clip-hosting site (it forwards to the bot over the server's internal network), no trailing slash
-local API_SECRET = "71fefba29e4dadfc22e9af5d690ae7f82e0687eada0d53702519c6cb653efaf4" -- the ROBLOX_WEBHOOK_SECRET stored in Mongo (config > api_keys) or in clip-hosting's env
+-- set by the loader, never stored here (this file is public): getgenv().SCRIM_API_SECRET and getgenv().SCRIM_MAP.
+-- Each map's server has its own secret (ROBLOX_WEBHOOK_SECRET for flats, ROBLOX_WEBHOOK_SECRET_DD for doubledecker);
+-- the bot works out the map from the secret, SCRIM_MAP only picks which map the game loads.
+local API_SECRET = tostring((getgenv and getgenv() or _G).SCRIM_API_SECRET or "")
+local SCRIM_MAP = string.lower(tostring((getgenv and getgenv() or _G).SCRIM_MAP or "flats"))
+local MAP_ARG = ({ flats = "LeagueStandard", doubledecker = "DoubleDecker" })[SCRIM_MAP] -- the game's map name for StartMinigame
 local DRY_RUN = false                           -- true = print every remote instead of firing it (safe test)
 local LOBBY_CAP = 10                            -- timer stops resetting once this many verified players are in
 local PRACTICE_MIN_PLAYERS = 2                  -- while the lobby waits for the real match, this many verified players get practice rounds
@@ -482,7 +487,7 @@ end
 local checkRoundState -- forward declaration
 
 -- match round mode, set from Discord (/scrim config mode or the console): 0 = normal, 1 = shrink
-local ROUND_MODES = { [0] = { "LeagueStandard", "Normal" }, [1] = { "Shrink", "Multi" } }
+local ROUND_MODES = { [0] = { MAP_ARG or "LeagueStandard", "Normal" }, [1] = { "Shrink", "Multi" } }
 local GameMode = 0
 local function roundArgs()
 	local m = ROUND_MODES[GameMode] or ROUND_MODES[0]
@@ -1124,8 +1129,12 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 	if not httpRequest then
 		warn("[SCRIM] This executor has no HTTP request function; the scrim agent is disabled.")
 		agentEnabled = false
-	elseif string.find(API_URL, "YOUR-", 1, true) or string.find(API_SECRET, "YOUR_", 1, true) then
-		warn("[SCRIM] Set API_URL / API_SECRET at the top of the script; the scrim agent is disabled.")
+	elseif string.find(API_URL, "YOUR-", 1, true) or API_SECRET == "" then
+		warn("[SCRIM] Set getgenv().SCRIM_API_SECRET in the loader (and API_URL at the top of the script); the scrim agent is disabled.")
+		agentEnabled = false
+	elseif not MAP_ARG then
+		-- a wrong map name must not quietly play another map's rounds into this map's ladder
+		warn("[SCRIM] Unknown getgenv().SCRIM_MAP '" .. SCRIM_MAP .. "' (use flats or doubledecker); the scrim agent is disabled.")
 		agentEnabled = false
 	end
 
@@ -1539,7 +1548,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			Body = HttpService:JSONEncode(body),
 		})
 		if not ok or not res then return nil, tostring(res) end
-		if res.StatusCode == 401 then return nil, "HTTP 401: API_SECRET does not match ROBLOX_WEBHOOK_SECRET (Mongo config > api_keys, or clip-hosting env)" end
+		if res.StatusCode == 401 then return nil, "HTTP 401: SCRIM_API_SECRET matches no map's secret (ROBLOX_WEBHOOK_SECRET / ROBLOX_WEBHOOK_SECRET_DD in Mongo config > api_keys, or clip-hosting env)" end
 		if res.StatusCode == 404 then return nil, "HTTP 404: wrong API_URL, or clip-hosting has not been updated with /api/scrim/sync yet" end
 		if res.StatusCode == 503 then return nil, "HTTP 503: clip-hosting cannot reach the database" end
 		if res.StatusCode == 504 or res.StatusCode == 502 then return nil, "HTTP " .. tostring(res.StatusCode) .. ": the Discord bot did not answer (is it online with the scrim update deployed?)" end
@@ -2229,7 +2238,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			if #eligible > 14 then
 				Act.fireFirst("StartMinigame", "Timebomb", "Shrink", "Multi") -- big lobby: faster multi-bomb shrink round
 			else
-				Act.fireFirst("StartMinigame", "Timebomb", "LeagueStandard", "Normal")
+				Act.fireFirst("StartMinigame", "Timebomb", MAP_ARG, "Normal")
 			end
 			local kind, value = awaitCaptainResult()
 			endCaptainRound()
@@ -2842,7 +2851,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 		end)
 	end
 
-	print(string.format("[SCRIM] API %s | remote gap %.1fs | kick lockout %s | DRY_RUN %s", API_URL, ACTION_GAP, tostring(KICK_DURATION), tostring(DRY_RUN)))
+	print(string.format("[SCRIM] map %s (%s) | API %s | remote gap %.1fs | kick lockout %s | DRY_RUN %s", SCRIM_MAP, MAP_ARG, API_URL, ACTION_GAP, tostring(KICK_DURATION), tostring(DRY_RUN)))
 	print("[SCRIM] Agent ready. Waiting for /scrim start" .. (DRY_RUN and " (DRY RUN: no remotes are fired)" or ""))
 end)()
 
