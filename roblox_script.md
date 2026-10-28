@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.13.0" -- bump on every edit
+local SCRIPT_VERSION = "1.13.1" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -488,6 +488,7 @@ local checkRoundState -- forward declaration
 
 -- match round mode, set from Discord (/scrim config mode or the console): 0 = normal, 1 = shrink
 local ROUND_MODES = { [0] = { MAP_ARG or "LeagueStandard", "Normal" }, [1] = { "Shrink", "Multi" } }
+if SCRIM_MAP == "doubledecker" then ROUND_MODES[1] = ROUND_MODES[0] end -- Double Decker has no shrink mode: shrink plays as normal
 local GameMode = 0
 local function roundArgs()
 	local m = ROUND_MODES[GameMode] or ROUND_MODES[0]
@@ -1832,7 +1833,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			end
 			if cfg.mode ~= GameMode then
 				GameMode = cfg.mode
-				if phase ~= "IDLE" then say("Mode: " .. (GameMode == 1 and "Shrink" or "Normal") .. " (from the next round)") end
+				if phase ~= "IDLE" then say("Mode: " .. (GameMode == 1 and SCRIM_MAP ~= "doubledecker" and "Shrink" or "Normal") .. " (from the next round)") end
 			end
 		end
 		-- only a response to our own session carries a real verified list (a restarted script gets none until it joins)
@@ -2235,7 +2236,7 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			if not captainPhaseActive() then return nil end
 			clearTheField()
 			if not captainPhaseActive() then return nil end
-			if #eligible > 14 then
+			if #eligible > 14 and SCRIM_MAP ~= "doubledecker" then -- Double Decker has no shrink mode
 				Act.fireFirst("StartMinigame", "Timebomb", "Shrink", "Multi") -- big lobby: faster multi-bomb shrink round
 			else
 				Act.fireFirst("StartMinigame", "Timebomb", MAP_ARG, "Normal")
