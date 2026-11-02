@@ -2237,7 +2237,8 @@ local httpRequest = (syn and syn.request) or (http and http.request) or http_req
 			if not captainPhaseActive() then return nil end
 			clearTheField()
 			if not captainPhaseActive() then return nil end
-			if #eligible > 14 and SCRIM_MAP ~= "doubledecker" then -- Double Decker has no shrink mode
+			-- count the benched round-1 captain too, so round 2 matches round 1 for the same lobby
+			if #eligible + (excludeId and 1 or 0) >= 12 and SCRIM_MAP ~= "doubledecker" then -- Double Decker has no shrink mode
 				Act.fireFirst("StartMinigame", "Timebomb", "Shrink", "Multi") -- big lobby: faster multi-bomb shrink round
 			else
 				Act.fireFirst("StartMinigame", "Timebomb", MAP_ARG, "Normal")
