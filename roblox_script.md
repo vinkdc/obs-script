@@ -9,7 +9,7 @@ local LocalPlayer = Players.LocalPlayer
 
 local AnnounceEvent = game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("RemoteEvent")
 
-local SCRIPT_VERSION = "1.13.2" -- bump on every edit
+local SCRIPT_VERSION = "1.13.3" -- bump on every edit
 
 --// SETTINGS
 local PLAYING_TEAM_NAME = "Playing"
@@ -670,20 +670,32 @@ local koEvents = {}          -- { { name = "Killer", t = os.clock(), left = 1 } 
 local koTracking = false     -- true once any player's KOs stat has been found
 
 local function hookKOs(player)
-	local ls = player:WaitForChild("leaderstats", 10)
-	if not ls then return end
-	local stat = ls:FindFirstChild(KO_STAT_NAME) or ls:WaitForChild(KO_STAT_NAME, 5)
-	if not stat or not stat:IsA("ValueBase") then return end
-	koTracking = true
-	local last = stat.Value
-	on(stat:GetPropertyChangedSignal("Value"), function()
-		local v = stat.Value
-		if type(v) == "number" and type(last) == "number" and v > last and RoundActive and SeriesActive then -- SeriesActive: not during the captain rounds
-			table.insert(koEvents, { name = player.Name, t = os.clock(), left = v - last })
-			print("[KO] " .. player.Name .. " KOs " .. last .. " -> " .. v)
-		end
-		last = v
-	end)
+	-- keeps retrying for as long as the player is in the server and re-attaches if the game replaces the stat object
+	-- (a one-shot hook that gave up after 15s left some players with no KO tracking at all)
+	local hooked, conn = nil, nil
+	local function attach()
+		local ls = player:FindFirstChild("leaderstats")
+		local stat = ls and ls:FindFirstChild(KO_STAT_NAME)
+		if not stat or not stat:IsA("ValueBase") or stat == hooked then return end
+		hooked = stat
+		if conn then conn:Disconnect() end
+		koTracking = true
+		local last = stat.Value
+		conn = on(stat:GetPropertyChangedSignal("Value"), function()
+			local v = stat.Value
+			if type(v) == "number" and type(last) == "number" and v > last and RoundActive and SeriesActive then -- SeriesActive: not during the captain rounds
+				table.insert(koEvents, { name = player.Name, t = os.clock(), left = v - last })
+				print("[KO] " .. player.Name .. " KOs " .. last .. " -> " .. v)
+			end
+			last = v
+		end)
+		print("[KO] hooked " .. player.Name)
+	end
+	while Running and player.Parent do
+		attach()
+		task.wait(1)
+	end
+	if conn then conn:Disconnect() end
 end
 
 -- the oldest unmatched KO that rose shortly before this death
@@ -777,6 +789,10 @@ local function processPendingDeaths()
 		local killer
 		if koTracking then
 			killer = takeKO(deathClock[victim] or os.clock())
+			if not killer and bomb and bomb.holder == victim and bomb.killer then
+				killer = bomb.killer -- backup: no KO matched (stat missing or late), so credit whoever passed the bomb last
+				print("[KO] no KO matched for " .. victim .. ", using bomb chain: " .. tostring(killer))
+			end
 		else
 			killer = bomb and bomb.killer or nil
 		end
@@ -852,7 +868,7 @@ local function handleDeath(victimName)
 	-- short window so every victim of the same explosion lands in one batch
 	if not processScheduled then
 		processScheduled = true
-		task.delay(0.6, function() -- long enough for the KOs stat to replicate
+		task.delay(1.0, function() -- long enough for the KOs stat to replicate
 			processScheduled = false
 			processPendingDeaths()
 		end)
